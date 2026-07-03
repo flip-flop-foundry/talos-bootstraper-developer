@@ -1,0 +1,5 @@
+# User-owned, per-checkout workspace files seeded from the tracked template
+# by .devcontainer/post-create.sh. The tracked template
+# (talos-bootstrapper.code-workspace) stays clean; user edits and imported
+# environments live in .local/talos-bootstrapper.code-workspace.
+.local/

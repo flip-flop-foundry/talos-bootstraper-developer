@@ -1,0 +1,40 @@
+{
+  "name": "talos-bootstrap-devcontainer",
+  "image": "ghcr.io/flip-flop-foundry/k8s-dev-image:latest",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "mounts": [
+    "source=talos-bootstrapper-data,target=/workspaces/talos-bootstrapper-data,type=volume"
+  ],
+  "postCreateCommand": "${containerWorkspaceFolder}/.devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "timonwong.shellcheck",
+        "mads-hartmann.bash-ide-vscode",
+        "redhat.vscode-yaml",
+        "mhutchie.git-graph",
+        "ms-kubernetes-tools.vscode-kubernetes-tools",
+        "augustocdias.tasks-shell-input",
+        "GitHub.copilot-chat"
+      ]
+    }
+  },
+  "containerEnv": {
+    "TALOS_BOOTSTRAPPER_DATA_DIR": "/workspaces/talos-bootstrapper-data",
+    "TALOS_BOOTSTRAPER_REPO_URL": "https://github.com/flip-flop-foundry/talos-bootstraper.git"
+  },
+  "remoteEnv": {
+    "KUBECONFIG": "${containerWorkspaceFolder}/.vscode/current/kubeconfig",
+    "TALOSCONFIG": "${containerWorkspaceFolder}/.vscode/current/talosconfig"
+  },
+  "forwardPorts": [5900],
+  "portsAttributes": {
+    "5900": {
+      "label": "VNC (KubeVirt)",
+      "onAutoForward": "silent"
+    }
+  },
+  "remoteUser": "vscode"
+}

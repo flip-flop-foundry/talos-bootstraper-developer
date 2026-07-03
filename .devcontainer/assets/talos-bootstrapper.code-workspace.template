@@ -1,0 +1,13 @@
+{
+  "folders": [
+    {
+      "name": "devenv",
+      "path": "."
+    },
+    {
+      "name": "talos-bootstraper",
+      "path": "/workspaces/talos-bootstrapper-data/talos-bootstraper"
+    }
+  ],
+  "settings": {}
+}

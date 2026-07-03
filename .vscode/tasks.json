@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Import environment",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/import-environment.sh",
+      "args": [
+        "${input:repoUrl}",
+        "${input:envName}",
+        "${workspaceFolder:devenv}/.local/talos-bootstrapper.code-workspace",
+        "${env:TALOS_BOOTSTRAPPER_DATA_DIR}/environments",
+        "${input:trustAllCerts}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "repoUrl",
+      "type": "promptString",
+      "description": "Git repository URL to clone (required)"
+    },
+    {
+      "id": "envName",
+      "type": "promptString",
+      "description": "Environment name (optional — leave empty to derive from the repo URL)",
+      "default": ""
+    },
+    {
+      "id": "trustAllCerts",
+      "type": "pickString",
+      "description": "Trust all TLS certificates during git clone (use only for self-signed hosts)",
+      "options": [
+        "false",
+        "true"
+      ],
+      "default": "false"
+    }
+  ]
+}
