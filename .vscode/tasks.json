@@ -19,18 +19,194 @@
         "clear": true
       },
       "problemMatcher": []
+    },
+    {
+      "label": "Set Active Talos/Kube Context",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/set-active-talos-kube-context.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Render Overlay",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/render-overlay.sh",
+      "args": [
+        "${env:TALOS_BOOTSTRAPPER_DATA_DIR}/environments/${input:activeEnvName}/${input:activeEnvName}.env"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Render and Push to Gitea",
+      "dependsOn": ["Render Overlay"],
+      "dependsOrder": "sequence",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/push-to-gitea.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Reset Talos Node System Volumes",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/reset-talos-nodes.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Generate Talos Image URLs",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/generate-image-urls.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Prepare Node for Downtime",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/prepare-node-for-downtime.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Apply Talos configs",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/cluster-initialSetup.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Apply Overlay",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/cluster-bootstrap.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Apply Node Registry Config",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/apply-node-registry-config.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Setup PXE Server",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/pxe-setup.sh",
+      "args": [
+        "${input:activeEnvName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Bootstrap Customer",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/bootstrap-customer.sh",
+      "args": [
+        "${input:activeEnvName}",
+        "${input:customerName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "focus": true
+      },
+      "problemMatcher": []
     }
   ],
   "inputs": [
     {
       "id": "repoUrl",
       "type": "promptString",
-      "description": "Git repository URL to clone (required)"
+      "description": "Git repository URL to clone (leave empty to seed a new environment from the built-in template)",
+      "default": ""
     },
     {
       "id": "envName",
       "type": "promptString",
-      "description": "Environment name (optional — leave empty to derive from the repo URL)",
+      "description": "Environment name (optional when cloning — derived from the repo URL; required when seeding from the template)",
       "default": ""
     },
     {
@@ -42,6 +218,22 @@
         "true"
       ],
       "default": "false"
+    },
+    {
+      "id": "activeEnvName",
+      "type": "command",
+      "command": "shellCommand.execute",
+      "args": {
+        "description": "Select an environment",
+        "command": "for d in \"${env:TALOS_BOOTSTRAPPER_DATA_DIR}\"/environments/*/; do name=$(basename \"$d\"); [ -f \"$d/$name.env\" ] && echo \"$name\"; done",
+        "taskId": "activeEnvName",
+        "rememberPrevious": true
+      }
+    },
+    {
+      "id": "customerName",
+      "type": "promptString",
+      "description": "Customer name (lowercase, used as Gitea org name and namespace prefix)"
     }
   ]
 }

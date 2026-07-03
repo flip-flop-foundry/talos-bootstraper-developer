@@ -3,3 +3,7 @@
 # (talos-bootstrapper.code-workspace) stays clean; user edits and imported
 # environments live in .local/talos-bootstrapper.code-workspace.
 .local/
+
+# Active Talos/Kube context symlinks written by the "Set Active Talos/Kube
+# Context" task. Wired to TALOSCONFIG/KUBECONFIG in devcontainer.json.
+.vscode/current/

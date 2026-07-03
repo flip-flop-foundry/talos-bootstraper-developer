@@ -1,0 +1,12 @@
+Thins have changed around quite a bit in this repo and the folder structure. 
+
+I would like to start migrating a log of the vscode tasks from talos-bootstrapper to devenv.
+
+
+If we can simply things while doing this work, lets do that.
+
+I think it makes sense to start with "Set Active Talos/Kube Context"
+
+When run, can the user be presented with options to select 
+
+
