@@ -3,7 +3,7 @@
   "tasks": [
     {
       "label": "Import environment",
-      "type": "shell",
+      "type": "process",
       "command": "${workspaceFolder:devenv}/.vscode/tasks/import-environment.sh",
       "args": [
         "${input:repoUrl}",
