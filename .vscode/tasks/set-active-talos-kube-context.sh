@@ -86,14 +86,14 @@ if [[ -f "$trusted_cert_path" ]]; then
   log_info "Cluster CA already present in the devcontainer trust store: $trusted_cert_path"
 else
   if ! command -v kubectl >/dev/null 2>&1; then
-    log_warn "kubectl is not available; cannot fetch $CERT_MGR_NAMESPACE/k8s-ca-secret."
+    log_warn "kubectl is not available; cannot fetch $CERT_MGR_NAMESPACE/$OVERLAY_NAME-ca-secret."
   else
     tmp_ca_dir=$(mktemp -d)
     tmp_ca_file="$tmp_ca_dir/${OVERLAY_NAME}-ca.crt"
 
     log_info "Fetching cluster CA certificate into a temporary file"
     if kubectl --kubeconfig "$active_dir/kubeconfig" \
-      get secret k8s-ca-secret \
+      get secret "$OVERLAY_NAME-ca-secret" \
       -n "$CERT_MGR_NAMESPACE" \
       -o jsonpath='{.data.ca\.crt}' 2>/dev/null \
       | base64 -d >"$tmp_ca_file"; then
@@ -103,10 +103,10 @@ else
           log_warn "Could not update the devcontainer trust store for $trusted_cert_path"
         fi
       else
-        log_warn "Secret $CERT_MGR_NAMESPACE/k8s-ca-secret did not return a CA certificate; skipping trust-store update."
+        log_warn "Secret $CERT_MGR_NAMESPACE/$OVERLAY_NAME-ca-secret did not return a CA certificate; skipping trust-store update."
       fi
     else
-      log_warn "Could not fetch CA certificate from $CERT_MGR_NAMESPACE/k8s-ca-secret; skipping trust-store update."
+      log_warn "Could not fetch CA certificate from $CERT_MGR_NAMESPACE/$OVERLAY_NAME-ca-secret; skipping trust-store update."
     fi
     rm -rf "$tmp_ca_dir"
   fi

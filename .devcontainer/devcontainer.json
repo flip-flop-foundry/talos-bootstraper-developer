@@ -1,6 +1,6 @@
 {
   "name": "talos-bootstrap-devcontainer",
-  "image": "ghcr.io/flip-flop-foundry/k8s-dev-image:latest",
+  "image": "ghcr.io/flip-flop-foundry/k8s-dev-image:1.4.0",
   "features": {
     "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
   },

@@ -221,6 +221,22 @@ if [[ "$GITEA_ALREADY_BOOTSTRAPPED" == "false" ]]; then
   log_info "Copying overlay directory to git-bootstrap-server pod"
   kubectl cp "$OVERLAY_DIR/." "argocd/git-bootstrap-server:/tmp/gitsrc"
   kubectl cp "$BASE_DIR/argocd/bootstrap/commitAndPush.sh" "argocd/git-bootstrap-server:/tmp/commitAndPush.sh"
+
+  if ! kubectl exec -n argocd git-bootstrap-server -- test -d /tmp/gitsrc; then
+    log_error "Expected /tmp/gitsrc to exist inside git-bootstrap-server pod after copy."
+    exit 1
+  fi
+
+  if ! kubectl exec -n argocd git-bootstrap-server -- test -f /tmp/commitAndPush.sh; then
+    log_error "Expected /tmp/commitAndPush.sh to exist inside git-bootstrap-server pod after copy."
+    exit 1
+  fi
+
+  if ! kubectl exec -n argocd git-bootstrap-server -- /bin/sh -c 'command -v git >/dev/null'; then
+    log_error "git is not available inside git-bootstrap-server pod."
+    exit 1
+  fi
+
   kubectl exec -n argocd git-bootstrap-server -- chmod +x /tmp/commitAndPush.sh
   kubectl exec -n argocd git-bootstrap-server -- /tmp/commitAndPush.sh
 
