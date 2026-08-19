@@ -201,7 +201,15 @@ collect_overlay_files() {
         
         # Find YAML files recursively in this component
         while IFS= read -r file; do
-            [[ -n "$file" ]] && files+=("$file")
+            [[ -n "$file" ]] || continue
+            # Skip files under a component's workflows/ or templates/ subtree.
+            # These are handled by dedicated passes (Gitea Actions workflows are
+            # flattened into <env>/.gitea/workflows/, and template trees such as
+            # Coder Terraform are rendered into _rendered/<component>/templates/).
+            case "$file" in
+                */workflows/*|*/templates/*) continue ;;
+            esac
+            files+=("$file")
         done < <(find_yaml_files "$component_dir" 999)
     done
     
@@ -508,6 +516,126 @@ process_files() {
 }
 
 ################################################################################
+# Template trees & Gitea Actions workflows
+#
+# These two passes handle files that must NOT be treated as ordinary Kubernetes
+# manifests:
+#   - <component>/templates/**   (e.g. Coder Terraform) -> _rendered/<c>/templates/**
+#   - <component>/workflows/*.y*  (Gitea Actions)        -> <env>/.gitea/workflows/*
+# Both respect EXCLUDED_BASE and apply envsubst with the same whitelist. The
+# envsubst whitelist means non-env `${...}` tokens (Terraform interpolation,
+# `${{ secrets.* }}`, shell vars) are preserved verbatim.
+################################################################################
+
+# Render every file under each component's templates/ dir (base first, then
+# overlay so overlay files overwrite base by relative path). The per-component
+# output dir is pruned first so files removed from source do not linger.
+process_template_dirs() {
+    local base_dir="$1"
+    local overlay_dir="$2"
+    local output_dir="$3"
+    local dry_run="$4"
+
+    local scope_root component_dir component file rel out
+
+    # Prune pass: for every non-excluded component that has a templates/ dir in
+    # base or overlay, clear its rendered templates output so stale/renamed files
+    # do not survive into _rendered/ (and thus into Gitea).
+    if [[ "$dry_run" == "false" ]]; then
+        typeset -A pruned
+        for scope_root in "$base_dir" "$overlay_dir"; do
+            [[ -d "$scope_root" ]] || continue
+            for component_dir in "$scope_root"/*; do
+                [[ -d "$component_dir/templates" ]] || continue
+                component=$(basename "$component_dir")
+                [[ -n "${pruned[$component]:-}" ]] && continue
+                is_excluded "$component" "templates" && continue
+                rm -rf "$output_dir/$component/templates"
+                pruned[$component]=1
+            done
+        done
+    fi
+
+    for scope_root in "$base_dir" "$overlay_dir"; do
+        [[ -d "$scope_root" ]] || continue
+        for component_dir in "$scope_root"/*; do
+            [[ -d "$component_dir/templates" ]] || continue
+            component=$(basename "$component_dir")
+
+            while IFS= read -r file; do
+                [[ -n "$file" ]] || continue
+                rel="${file#$component_dir/templates/}"
+                # Honour component- and file-level exclusions.
+                if is_excluded "$component" "templates/$rel"; then
+                    continue
+                fi
+                out="$output_dir/$component/templates/$rel"
+                if [[ "$dry_run" == "true" ]]; then
+                    log_info "  [DRY-RUN] Would render template: $file -> $out"
+                    continue
+                fi
+                mkdir -p "$(dirname "$out")"
+                if ! envsubst "$ENVSUBST_VARS" < "$file" > "$out" 2>/dev/null; then
+                    log_warn "envsubst failed for $file, copying as-is"
+                    cp "$file" "$out"
+                fi
+            done < <(find "$component_dir/templates" -type f 2>/dev/null | sort)
+        done
+    done
+}
+
+# Flatten every component's workflows/*.yaml into <env>/.gitea/workflows/ so
+# Gitea Actions can discover them at the repo root. Output files are prefixed
+# with the component name to avoid basename collisions between components. The
+# directory is fully generated, so it is rebuilt from scratch each run.
+process_workflows() {
+    local base_dir="$1"
+    local overlay_dir="$2"
+    local dry_run="$3"
+
+    local wf_out="$overlay_dir/.gitea/workflows"
+    local scope_root component_dir component file out base_name
+
+    if [[ "$dry_run" == "false" ]]; then
+        rm -rf "$wf_out"
+    fi
+
+    local wrote_any="false"
+    for scope_root in "$base_dir" "$overlay_dir"; do
+        [[ -d "$scope_root" ]] || continue
+        for component_dir in "$scope_root"/*; do
+            [[ -d "$component_dir/workflows" ]] || continue
+            component=$(basename "$component_dir")
+
+            while IFS= read -r file; do
+                [[ -n "$file" ]] || continue
+                base_name=$(basename "$file")
+                if is_excluded "$component" "workflows/$base_name"; then
+                    continue
+                fi
+                # Prefix with component name so two components can't collide on
+                # a shared basename (Gitea scans .gitea/workflows/ non-recursively).
+                out="$wf_out/${component}-${base_name}"
+                if [[ "$dry_run" == "true" ]]; then
+                    log_info "  [DRY-RUN] Would render workflow: $file -> $out"
+                    continue
+                fi
+                mkdir -p "$wf_out"
+                if ! envsubst "$ENVSUBST_VARS" < "$file" > "$out" 2>/dev/null; then
+                    log_warn "envsubst failed for $file, copying as-is"
+                    cp "$file" "$out"
+                fi
+                wrote_any="true"
+            done < <(find "$component_dir/workflows" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort)
+        done
+    done
+
+    if [[ "$dry_run" == "false" && "$wrote_any" == "true" ]]; then
+        log_success "Rendered Gitea Actions workflows to: $wf_out"
+    fi
+}
+
+################################################################################
 # Main
 ################################################################################
 
@@ -593,6 +721,11 @@ main() {
     
     # Process files
     process_files "$talos_submodule_root" "$base_dir" "$overlay_dir" "$output_dir" "$dry_run"
+
+    # Render non-manifest template trees (e.g. Coder Terraform) and flatten
+    # Gitea Actions workflows into <env>/.gitea/workflows/.
+    process_template_dirs "$base_dir" "$overlay_dir" "$output_dir" "$dry_run"
+    process_workflows "$base_dir" "$overlay_dir" "$dry_run"
 }
 
 main "$@"

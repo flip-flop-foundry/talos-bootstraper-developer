@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Push the rendered manifests of an environment to its Gitea cluster-services repo.
 #
-# Scope-limited by design: only files under $ENV/_rendered/ are ever committed.
+# Scope-limited by design: only files under $ENV/_rendered/ and the generated
+# $ENV/.gitea/ (Gitea Actions workflows) are ever committed.
 # Source overlays (env file, talos configs, per-node patches, customer descriptors)
 # stay local and never leak to Gitea.
 #
@@ -88,6 +89,23 @@ rsync -a --delete "$rendered_dir/" "$tmp_repo/_rendered/"
 
 # Only stage files under _rendered/. Nothing else can ever get committed.
 git -C "$tmp_repo" add -A -- _rendered/
+
+# --- mirror generated Gitea Actions workflows (.gitea/workflows/) if present ---
+# render-overlay.sh flattens component workflows into <env>/.gitea/workflows/.
+# Scope strictly to .gitea/workflows/ so we never touch any other .gitea/ content
+# in the repo. If the local workflows dir is absent, remove any stale remote copy.
+wf_src="$env_dir/.gitea/workflows"
+wf_dst="$tmp_repo/.gitea/workflows"
+if [[ -d "$wf_src" ]]; then
+  log_info "Syncing $wf_src/ -> $wf_dst/"
+  mkdir -p "$wf_dst"
+  rsync -a --delete "$wf_src/" "$wf_dst/"
+  git -C "$tmp_repo" add -A -- .gitea/workflows/
+elif [[ -d "$wf_dst" ]]; then
+  log_info "No local workflows; removing stale $wf_dst/"
+  rm -rf "$wf_dst"
+  git -C "$tmp_repo" add -A -- .gitea/workflows/
+fi
 
 if git -C "$tmp_repo" diff --cached --quiet; then
   log_success "No changes under _rendered/ to push."
