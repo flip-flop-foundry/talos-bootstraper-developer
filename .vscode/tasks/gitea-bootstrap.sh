@@ -67,6 +67,20 @@ readonly REGISTRY_PULL_SECRET="gitea-registry-pull-credentials"  # K8s secret in
 readonly REGISTRY_PULL_SECRET_DESCRIPTION="Read-only Gitea credentials for Talos RegistryAuthConfig — allows containerd on all nodes to pull images from the Gitea container registry"
 readonly REGISTRY_PULL_PASSWORD_LENGTH=32
 
+# Coder ↔ Gitea integration. Two persistent OAuth2 apps (runtime login + workspace
+# git external-auth) and one EPHEMERAL scoped CI credential the Coder PostSync Job
+# consumes once to publish CODER_SESSION_TOKEN, then revokes + deletes.
+readonly CODER_OIDC_APP_NAME="Coder OIDC Login"
+readonly CODER_OIDC_SECRET="coder-oidc"                       # k8s secret in CODER_NAMESPACE (client-id/client-secret)
+readonly CODER_EXTERNAL_AUTH_APP_NAME="Coder Workspace Git"
+readonly CODER_EXTERNAL_AUTH_SECRET="coder-external-auth"     # k8s secret in CODER_NAMESPACE (client-id/client-secret)
+readonly CODER_CI_USERNAME="coder-ci"
+readonly CODER_CI_SECRET="coder-gitea-ci"                     # EPHEMERAL k8s secret in CODER_NAMESPACE
+readonly CODER_CI_TOKEN_NAME="coder-ci-repo-secret-writer"
+readonly CODER_CI_TOKEN_SCOPES='["write:repository"]'
+readonly CODER_CI_PASSWORD_LENGTH=32
+readonly CODER_SESSION_TOKEN_SECRET_NAME="CODER_SESSION_TOKEN"  # Gitea repo Actions secret published by the Coder Job
+
 readonly ADMIN_TOKEN_SCOPES='["write:repository","write:organization","write:admin"]' #Scopes for the temporary admin token
 readonly ARGOCD_SERVICE_PASSWORD_LENGTH=32
 readonly GITEA_READY_MAX_RETRIES=60
@@ -538,6 +552,17 @@ main() {
     fi
     log_success "Registry-pull service account ready: $GITEA_NAMESPACE/$REGISTRY_PULL_SECRET"
     echo ""
+
+    ############################################################################
+    # Coder ↔ Gitea integration (OIDC login, workspace git external-auth,
+    # ephemeral CI credential for the Coder PostSync Job).
+    ############################################################################
+    if ! setup_coder_gitea_integration "$gitea_api_url" "$token"; then
+        log_error "Failed to set up Coder ↔ Gitea integration"
+        exit 1
+    fi
+    echo ""
+
     # Summary
     log_success \"Gitea bootstrap complete!\"
     log_info \"Organization: $GITEA_CLUSTER_GITEA_ORG_NAME\"
@@ -550,5 +575,140 @@ main() {
     log_info \"Local repository state has been restored\"
     log_info \"ArgoCD is now configured to access Gitea repositories\"
 }
+# Ensure a Gitea OAuth2 app exists and its client_id/client_secret are stored in a
+# k8s secret. Gitea only returns client_secret at creation, so a missing secret
+# forces the app to be recreated.
+# Args: app_name redirect_uri secret_name namespace api_url admin_token
+_ensure_coder_oauth2_secret() {
+    local app_name="$1" redirect_uri="$2" secret_name="$3" ns="$4" api_url="$5" admin_token="$6"
 
+    local have_secret=false
+    kubectl get secret "$secret_name" -n "$ns" &>/dev/null && have_secret=true
+
+    local app_id
+    app_id=$(find_gitea_oauth2_app "$app_name" "$api_url" "$admin_token") || return 1
+
+    if [[ -n "$app_id" && "$have_secret" == "true" ]]; then
+        log_success "OAuth2 app '$app_name' + secret $ns/$secret_name already present"
+        return 0
+    fi
+
+    if [[ -n "$app_id" && "$have_secret" != "true" ]]; then
+        log_warn "OAuth2 app '$app_name' exists but $ns/$secret_name is missing — recreating app for a fresh secret"
+        delete_gitea_oauth2_app "$app_id" "$api_url" "$admin_token" || true
+    fi
+
+    local creds client_id client_secret
+    creds=$(create_gitea_oauth2_app "$app_name" "$redirect_uri" "$api_url" "$admin_token") || return 1
+    client_id="${creds%%|*}"
+    client_secret="${creds#*|}"
+    if [[ -z "$client_id" || -z "$client_secret" ]]; then
+        log_error "OAuth2 app '$app_name' creation returned no credentials"
+        return 1
+    fi
+
+    kubectl create secret generic "$secret_name" -n "$ns" \
+        --from-literal=client-id="$client_id" \
+        --from-literal=client-secret="$client_secret" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    kubectl annotate secret "$secret_name" -n "$ns" \
+        description="Gitea OAuth2 credentials for Coder ($app_name). Auto-provisioned by gitea-bootstrap.sh." \
+        --overwrite &>/dev/null || true
+
+    log_success "Provisioned OAuth2 app '$app_name' → $ns/$secret_name"
+}
+
+# Provision the EPHEMERAL scoped CI credential (a restricted Gitea user with admin
+# on the cluster-services repo + a write:repository token) and stage it as a k8s
+# secret. The Coder PostSync Job uses it once to publish CODER_SESSION_TOKEN, then
+# revokes the token and deletes this secret — no standing credential is left behind.
+# Args: namespace org repo api_url admin_token
+_provision_coder_ci_credential() {
+    local ns="$1" org="$2" repo="$3" api_url="$4" admin_token="$5"
+
+    log_info "Provisioning ephemeral Coder CI credential (user: $CODER_CI_USERNAME)"
+
+    local ci_email="${CODER_CI_USERNAME}@${GITEA_DOMAIN_NAME}"
+    local ci_password
+    ci_password=$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c "$CODER_CI_PASSWORD_LENGTH")
+
+    create_or_ensure_gitea_user "$CODER_CI_USERNAME" "$ci_email" "$ci_password" "$api_url" "$admin_token" || return 1
+    add_gitea_repo_collaborator "$org" "$repo" "$CODER_CI_USERNAME" "admin" "$api_url" "$admin_token" || return 1
+
+    local ci_credentials="${CODER_CI_USERNAME}:${ci_password}"
+
+    # Drop any stale token of the same name — its sha is unreadable after creation.
+    local existing_id
+    existing_id=$(curl -k -s -S -u "$ci_credentials" "$api_url/users/$CODER_CI_USERNAME/tokens" \
+        | jq -r --arg n "$CODER_CI_TOKEN_NAME" '.[] | select(.name == $n) | .id' 2>/dev/null | head -n1)
+    if [[ -n "$existing_id" && "$existing_id" != "null" ]]; then
+        delete_gitea_token "$ci_credentials" "$existing_id" "$api_url" || true
+    fi
+
+    local token_result
+    token_result=$(create_gitea_token "$ci_credentials" "$api_url" "$CODER_CI_TOKEN_NAME" "$CODER_CI_TOKEN_SCOPES") || return 1
+    local ci_token_id="${token_result%%|*}"
+    local ci_token="${token_result#*|}"
+    if [[ -z "$ci_token" || "$ci_token" == "$token_result" ]]; then
+        log_error "Failed to mint CI token for $CODER_CI_USERNAME"
+        return 1
+    fi
+
+    kubectl create secret generic "$CODER_CI_SECRET" -n "$ns" \
+        --from-literal=username="$CODER_CI_USERNAME" \
+        --from-literal=password="$ci_password" \
+        --from-literal=token="$ci_token" \
+        --from-literal=token-id="$ci_token_id" \
+        --from-literal=api-url="$api_url" \
+        --from-literal=org="$org" \
+        --from-literal=repo="$repo" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    kubectl annotate secret "$CODER_CI_SECRET" -n "$ns" \
+        description="EPHEMERAL scoped Gitea CI credential for the Coder PostSync Job to publish CODER_SESSION_TOKEN. Revoked + deleted by the Job after use." \
+        --overwrite &>/dev/null || true
+
+    log_success "Ephemeral Coder CI credential staged: $ns/$CODER_CI_SECRET"
+}
+
+# Top-level Coder ↔ Gitea provisioning. No-op unless Coder is rendered for this env.
+# Args: gitea_api_url admin_token
+setup_coder_gitea_integration() {
+    local gitea_api_url="$1" admin_token="$2"
+
+    if [[ ! -d "$OVERLAY_DIR/_rendered/coder" ]]; then
+        log_info "Coder not rendered for this environment — skipping Coder ↔ Gitea integration"
+        return 0
+    fi
+    if [[ -z "${CODER_DOMAIN_NAME:-}" ]]; then
+        log_warn "CODER_DOMAIN_NAME is unset but Coder is rendered — skipping Coder ↔ Gitea integration"
+        return 0
+    fi
+
+    local ns="${CODER_NAMESPACE:-coder}"
+    local org="$GITEA_CLUSTER_GITEA_ORG_NAME"
+    local repo="$GITEA_CLUSTER_SERVICES_REPO_NAME"
+
+    log_info "Setting up Coder ↔ Gitea integration (namespace: $ns)"
+
+    # The coder namespace is created by ArgoCD slightly later; create it now
+    # (idempotently) so the secrets can be staged. ArgoCD adopts it on sync.
+    kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+    _ensure_coder_oauth2_secret "$CODER_OIDC_APP_NAME" \
+        "https://${CODER_DOMAIN_NAME}/api/v2/users/oidc/callback" \
+        "$CODER_OIDC_SECRET" "$ns" "$gitea_api_url" "$admin_token" || return 1
+
+    _ensure_coder_oauth2_secret "$CODER_EXTERNAL_AUTH_APP_NAME" \
+        "https://${CODER_DOMAIN_NAME}/external-auth/gitea/callback" \
+        "$CODER_EXTERNAL_AUTH_SECRET" "$ns" "$gitea_api_url" "$admin_token" || return 1
+
+    # Only stage the ephemeral CI credential if the token has not been published yet.
+    if gitea_repo_secret_exists "$org" "$repo" "$CODER_SESSION_TOKEN_SECRET_NAME" "$gitea_api_url" "$admin_token"; then
+        log_info "CODER_SESSION_TOKEN already published to $org/$repo — skipping ephemeral CI credential"
+    else
+        _provision_coder_ci_credential "$ns" "$org" "$repo" "$gitea_api_url" "$admin_token" || return 1
+    fi
+
+    log_success "Coder ↔ Gitea integration ready"
+}
 main "$@"

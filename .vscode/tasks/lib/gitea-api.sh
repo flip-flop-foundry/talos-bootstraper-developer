@@ -1185,4 +1185,114 @@ set_gitea_repo_secret() {
     fi
 }
 
+# Return 0 if a repository Actions secret with the given name already exists.
+# Gitea uppercases secret names, so the comparison is case-insensitive.
+# Args: owner repo secret_name api_url token
+gitea_repo_secret_exists() {
+    local owner="$1"
+    local repo="$2"
+    local secret_name="$3"
+    local api_url="$4"
+    local token="$5"
+
+    local response http_code body
+    response=$(curl -k -s -S -w "\n%{http_code}" -X GET \
+        -H "Authorization: token $token" \
+        "$api_url/repos/$owner/$repo/actions/secrets")
+    http_code=$(get_http_code "$response")
+    body=$(get_http_body "$response")
+
+    [[ "$http_code" == "200" ]] || return 1
+    echo "$body" | jq -e --arg n "$secret_name" \
+        'any(.[]; (.name | ascii_upcase) == ($n | ascii_upcase))' >/dev/null 2>&1
+}
+
+# Find a user-owned OAuth2 application by name.
+# Echoes the application id if found, empty otherwise. Returns 1 on API error.
+# Args: app_name api_url token
+find_gitea_oauth2_app() {
+    local app_name="$1"
+    local api_url="$2"
+    local token="$3"
+
+    local response
+    response=$(curl -k -s -S -w "\n%{http_code}" -X GET \
+        -H "Authorization: token $token" \
+        "$api_url/user/applications/oauth2")
+    local http_code body
+    http_code=$(get_http_code "$response")
+    body=$(get_http_body "$response")
+
+    if [[ "$http_code" != "200" ]]; then
+        log_error "Failed to list OAuth2 apps (HTTP $http_code): $body"
+        return 1
+    fi
+
+    echo "$body" | jq -r --arg n "$app_name" '.[] | select(.name == $n) | .id' | head -n1
+}
+
+# Create a confidential OAuth2 application owned by the authenticated user.
+# Gitea only returns client_secret at creation time, so callers MUST persist the
+# returned value immediately (there is no way to read it back later).
+# Echoes "client_id|client_secret" on success.
+# Args: app_name redirect_uri api_url token
+create_gitea_oauth2_app() {
+    local app_name="$1"
+    local redirect_uri="$2"
+    local api_url="$3"
+    local token="$4"
+
+    log_info "Creating Gitea OAuth2 app: $app_name"
+
+    local payload
+    payload=$(jq -n --arg n "$app_name" --arg r "$redirect_uri" \
+        '{name:$n, redirect_uris:[$r], confidential_client:true}')
+
+    local response
+    response=$(curl -k -s -S -w "\n%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -H "Authorization: token $token" \
+        -d "$payload" \
+        "$api_url/user/applications/oauth2")
+    local http_code body
+    http_code=$(get_http_code "$response")
+    body=$(get_http_body "$response")
+
+    if [[ "$http_code" != "201" ]]; then
+        log_error "Failed to create OAuth2 app '$app_name' (HTTP $http_code): $body"
+        return 1
+    fi
+
+    local client_id client_secret
+    client_id=$(echo "$body" | jq -r '.client_id')
+    client_secret=$(echo "$body" | jq -r '.client_secret')
+    if [[ -z "$client_id" || "$client_id" == "null" || -z "$client_secret" || "$client_secret" == "null" ]]; then
+        log_error "OAuth2 app '$app_name' created but client credentials missing from response"
+        return 1
+    fi
+
+    log_success "OAuth2 app created: $app_name"
+    echo "$client_id|$client_secret"
+}
+
+# Delete a user-owned OAuth2 application by id. Idempotent-ish: warns on failure.
+# Args: app_id api_url token
+delete_gitea_oauth2_app() {
+    local app_id="$1"
+    local api_url="$2"
+    local token="$3"
+
+    log_info "Deleting Gitea OAuth2 app id=$app_id"
+    local http_code
+    http_code=$(curl -k -s -S -o /dev/null -w "%{http_code}" -X DELETE \
+        -H "Authorization: token $token" \
+        "$api_url/user/applications/oauth2/$app_id")
+    if [[ "$http_code" == "204" ]]; then
+        log_success "OAuth2 app deleted (id=$app_id)"
+        return 0
+    fi
+    log_warn "Failed to delete OAuth2 app id=$app_id (HTTP $http_code)"
+    return 1
+}
+
 readonly GITEA_API_LOADED=1
