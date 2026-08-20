@@ -81,7 +81,7 @@ readonly CODER_CI_TOKEN_SCOPES='["write:repository"]'
 readonly CODER_CI_PASSWORD_LENGTH=32
 readonly CODER_SESSION_TOKEN_SECRET_NAME="CODER_SESSION_TOKEN"  # Gitea repo Actions secret published by the Coder Job
 
-readonly ADMIN_TOKEN_SCOPES='["write:repository","write:organization","write:admin"]' #Scopes for the temporary admin token
+readonly ADMIN_TOKEN_SCOPES='["write:repository","write:organization","write:admin","write:user"]' #Scopes for the temporary admin token (write:user needed to manage Coder OAuth2 apps under /user/applications/oauth2)
 readonly ARGOCD_SERVICE_PASSWORD_LENGTH=32
 readonly GITEA_READY_MAX_RETRIES=60
 readonly GITEA_READY_RETRY_INTERVAL=5
@@ -99,6 +99,7 @@ Arguments:
                                    \$TALOS_BOOTSTRAPPER_DATA_DIR/environments/
   --force-recreate-gitea-org       Delete and recreate organization and repository if they exist
   --force-recreate-argocd-svc-user Delete and recreate ArgoCD service account user and secrets
+  --coder-integration-only         Only (re)provision the Coder <-> Gitea secrets, then exit (idempotent; used on every apply)
 
 Requirements:
   - kubectl
@@ -226,6 +227,7 @@ main() {
     local env_file="$TALOS_BOOTSTRAPPER_DATA_DIR/environments/$env_name/$env_name.env"
     local force_recreate_gitea_org="false"
     local force_recreate_argocd_svc_user="false"
+    local coder_integration_only="false"
     
     # Parse optional flags
     shift  # Remove first argument (env_file)
@@ -239,6 +241,14 @@ main() {
             --force-recreate-argocd-svc-user)
                 force_recreate_argocd_svc_user="true"
                 log_warn "Force recreate ArgoCD service user mode enabled - will delete existing user and secrets"
+                shift
+                ;;
+            --coder-integration-only)
+                # Re-runnable path: (re)provision only the Coder ↔ Gitea secrets.
+                # Used by cluster-bootstrap.sh on every apply so Coder's OIDC /
+                # external-auth secrets are populated even when Gitea is already
+                # bootstrapped (the full main() flow is skipped in that case).
+                coder_integration_only="true"
                 shift
                 ;;
             *)
@@ -322,6 +332,19 @@ main() {
     local token="${token_result#*|}"
     GITEA_API_URL="$gitea_api_url"
     echo ""
+
+    # Re-runnable fast path: only (re)provision the Coder ↔ Gitea secrets, then
+    # exit. The EXIT trap revokes the temporary admin token. Everything below
+    # (org/repo/ArgoCD/registry-pull) is skipped.
+    if [[ "$coder_integration_only" == "true" ]]; then
+        if ! setup_coder_gitea_integration "$gitea_api_url" "$token"; then
+            log_error "Failed to set up Coder ↔ Gitea integration"
+            exit 1
+        fi
+        echo ""
+        log_success "Coder ↔ Gitea integration complete (coder-integration-only mode)"
+        return 0
+    fi
 
     ################################################################################
     #

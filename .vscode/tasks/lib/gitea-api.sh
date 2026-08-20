@@ -49,10 +49,15 @@ wait_for_gitea_ready() {
     local pod_ready=false
     
     while [[ $pod_elapsed -lt $pod_wait_timeout ]]; do
-        # Check if pod exists
-        if kubectl get pod -l app.kubernetes.io/name=gitea -n "$GITEA_NAMESPACE" &>/dev/null; then
+        # Only consider Running pods — stale Completed/Succeeded pods left behind
+        # by old ReplicaSets (e.g. after node reboots) also carry the gitea label
+        # and would make a label-wide `kubectl wait` hang forever.
+        local running_pod
+        running_pod=$(kubectl get pod -l app.kubernetes.io/name=gitea -n "$GITEA_NAMESPACE" \
+            --field-selector=status.phase=Running -o name 2>/dev/null | head -n1)
+        if [[ -n "$running_pod" ]]; then
             # Pod exists, wait for it to be ready
-            if kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=gitea -n "$GITEA_NAMESPACE" --timeout=10s &>/dev/null; then
+            if kubectl wait --for=condition=Ready "$running_pod" -n "$GITEA_NAMESPACE" --timeout=10s &>/dev/null; then
                 log_success "Gitea pod is ready"
                 pod_ready=true
                 break

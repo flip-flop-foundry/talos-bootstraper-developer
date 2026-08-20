@@ -327,6 +327,17 @@ log_info "Rendering overlay manifests..."
 "$SCRIPT_DIR/render-overlay.sh" "$CONFIG_FILE"
 
 
+# ============================================================================
+# CODER ↔ GITEA INTEGRATION (idempotent, every apply)
+# ============================================================================
+# Coder's OIDC / external-auth secrets are provisioned by gitea-bootstrap.sh.
+# On an already-bootstrapped cluster that full flow is skipped, so run just the
+# Coder integration here on every apply. It no-ops when Coder is not rendered or
+# when the secrets already exist. Coder hard-fails to boot if a provider is
+# declared with an empty client_id, so these secrets must always be populated.
+log_info "Ensuring Coder ↔ Gitea integration secrets are provisioned..."
+"$SCRIPT_DIR/gitea-bootstrap.sh" "$env_name" --coder-integration-only
+
 
 log_info "Checking if ArgoCD Helm release needs upgrading..."
 helm diff upgrade argocd argo/argo-cd \
