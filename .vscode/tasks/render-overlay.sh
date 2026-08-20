@@ -525,6 +525,9 @@ process_files() {
 # Both respect EXCLUDED_BASE and apply envsubst with the same whitelist. The
 # envsubst whitelist means non-env `${...}` tokens (Terraform interpolation,
 # `${{ secrets.* }}`, shell vars) are preserved verbatim.
+#
+# Initial use case for these passes is to support Coder's Terraform templates and Gitea Actions workflows
+# These files ARE NOT merged between base and overlay, if they exist in both, the overlay version is used.
 ################################################################################
 
 # Render every file under each component's templates/ dir (base first, then
