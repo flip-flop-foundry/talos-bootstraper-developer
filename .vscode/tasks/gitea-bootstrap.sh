@@ -605,8 +605,12 @@ main() {
 _ensure_coder_oauth2_secret() {
     local app_name="$1" redirect_uri="$2" secret_name="$3" ns="$4" api_url="$5" admin_token="$6"
 
+    # Present only if it carries BOTH keys; ArgoCD keeps an empty shell here.
     local have_secret=false
-    kubectl get secret "$secret_name" -n "$ns" &>/dev/null && have_secret=true
+    if [[ -n "$(kubectl get secret "$secret_name" -n "$ns" -o jsonpath='{.data.client-id}' 2>/dev/null)" \
+       && -n "$(kubectl get secret "$secret_name" -n "$ns" -o jsonpath='{.data.client-secret}' 2>/dev/null)" ]]; then
+        have_secret=true
+    fi
 
     local app_id
     app_id=$(find_gitea_oauth2_app "$app_name" "$api_url" "$admin_token") || return 1
@@ -630,10 +634,12 @@ _ensure_coder_oauth2_secret() {
         return 1
     fi
 
+    # Server-side apply with our own field manager so ArgoCD's ServerSideApply of the empty shell keeps these keys (client-side apply loses them to ArgoCD).
     kubectl create secret generic "$secret_name" -n "$ns" \
         --from-literal=client-id="$client_id" \
         --from-literal=client-secret="$client_secret" \
-        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+        --dry-run=client -o yaml \
+        | kubectl apply --server-side --field-manager=gitea-bootstrap-coder --force-conflicts -f - >/dev/null
     kubectl annotate secret "$secret_name" -n "$ns" \
         description="Gitea OAuth2 credentials for Coder ($app_name). Auto-provisioned by gitea-bootstrap.sh." \
         --overwrite &>/dev/null || true
@@ -677,6 +683,7 @@ _provision_coder_ci_credential() {
         return 1
     fi
 
+    # Not ArgoCD-managed (no shell in coderSecretBootstrap.yaml), so client-side apply is safe here.
     kubectl create secret generic "$CODER_CI_SECRET" -n "$ns" \
         --from-literal=username="$CODER_CI_USERNAME" \
         --from-literal=password="$ci_password" \
