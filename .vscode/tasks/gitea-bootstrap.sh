@@ -662,7 +662,10 @@ _provision_coder_ci_credential() {
     ci_password=$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c "$CODER_CI_PASSWORD_LENGTH")
 
     create_or_ensure_gitea_user "$CODER_CI_USERNAME" "$ci_email" "$ci_password" "$api_url" "$admin_token" || return 1
-    add_gitea_repo_collaborator "$org" "$repo" "$CODER_CI_USERNAME" "admin" "$api_url" "$admin_token" || return 1
+    # Gitea gates repo Actions-secret writes behind ownership (reqOwner); a repo admin
+    # collaborator is rejected, so the CI user must be an org owner. De-escalated by
+    # _deprovision_coder_ci_credential once CODER_SESSION_TOKEN is published.
+    add_user_to_org "$org" "$CODER_CI_USERNAME" "$api_url" "$admin_token" || return 1
 
     local ci_credentials="${CODER_CI_USERNAME}:${ci_password}"
 
@@ -700,6 +703,26 @@ _provision_coder_ci_credential() {
     log_success "Ephemeral Coder CI credential staged: $ns/$CODER_CI_SECRET"
 }
 
+# De-escalate once CODER_SESSION_TOKEN is published: the Job already revoked the
+# CI token + deleted the k8s secret, so remove the standing org-owner CI user too
+# (honours the "no standing credential" design). Idempotent + non-fatal.
+# Args: namespace org api_url admin_token
+_deprovision_coder_ci_credential() {
+    local ns="$1" org="$2" api_url="$3" admin_token="$4"
+
+    # Belt-and-suspenders: the Job deletes this after publishing, but clean it up
+    # here in case the Job was interrupted after the PUT but before its own cleanup.
+    kubectl delete secret "$CODER_CI_SECRET" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
+
+    local exists
+    exists=$(curl -k -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: token $admin_token" "$api_url/users/$CODER_CI_USERNAME")
+    if [[ "$exists" == "200" ]]; then
+        log_info "CODER_SESSION_TOKEN published — removing standing org-owner CI user '$CODER_CI_USERNAME'"
+        delete_gitea_user "$CODER_CI_USERNAME" "$api_url" "$admin_token" || true
+    fi
+}
+
 # Top-level Coder ↔ Gitea provisioning. No-op unless Coder is rendered for this env.
 # Args: gitea_api_url admin_token
 setup_coder_gitea_integration() {
@@ -735,6 +758,7 @@ setup_coder_gitea_integration() {
     # Only stage the ephemeral CI credential if the token has not been published yet.
     if gitea_repo_secret_exists "$org" "$repo" "$CODER_SESSION_TOKEN_SECRET_NAME" "$gitea_api_url" "$admin_token"; then
         log_info "CODER_SESSION_TOKEN already published to $org/$repo — skipping ephemeral CI credential"
+        _deprovision_coder_ci_credential "$ns" "$org" "$gitea_api_url" "$admin_token" || true
     else
         _provision_coder_ci_credential "$ns" "$org" "$repo" "$gitea_api_url" "$admin_token" || return 1
     fi
