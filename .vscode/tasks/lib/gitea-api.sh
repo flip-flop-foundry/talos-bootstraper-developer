@@ -1073,28 +1073,6 @@ create_or_ensure_gitea_user() {
     fi
 }
 
-# Delete a Gitea user via the admin API (purge removes any team/collab memberships).
-# Non-fatal: warns on failure so de-provisioning never breaks the bootstrap.
-# Args: username api_url admin_token
-delete_gitea_user() {
-    local username="$1"
-    local api_url="$2"
-    local admin_token="$3"
-
-    local resp
-    resp=$(curl -k -s -S -w "\n%{http_code}" -X DELETE \
-        -H "Authorization: token $admin_token" \
-        "$api_url/admin/users/$username?purge=true")
-    local http_code
-    http_code=$(get_http_code "$resp")
-
-    case "$http_code" in
-        204) log_success "Deleted Gitea user '$username'"; return 0 ;;
-        404) log_info "Gitea user '$username' already absent"; return 0 ;;
-        *) log_warn "Could not delete Gitea user '$username' (HTTP $http_code): $(get_http_body "$resp")"; return 1 ;;
-    esac
-}
-
 # Create or update an org-level Actions variable.
 # POST (create) / PUT (update) both target the NAMED endpoint.
 # Args: org var_name var_value api_url token

@@ -68,18 +68,18 @@ readonly REGISTRY_PULL_SECRET_DESCRIPTION="Read-only Gitea credentials for Talos
 readonly REGISTRY_PULL_PASSWORD_LENGTH=32
 
 # Coder ↔ Gitea integration. Two persistent OAuth2 apps (runtime login + workspace
-# git external-auth) and one EPHEMERAL scoped CI credential the Coder PostSync Job
-# consumes once to publish CODER_SESSION_TOKEN, then revokes + deletes.
+# git external-auth). CODER_SESSION_TOKEN is published to the repo with the Gitea
+# admin token (which never leaves the devenv): the Coder PostSync Job mints the
+# Coder token into an outbox secret and this script performs the Gitea write, so
+# no Gitea credential is ever staged into the coder namespace.
 readonly CODER_OIDC_APP_NAME="Coder OIDC Login"
 readonly CODER_OIDC_SECRET="coder-oidc"                       # k8s secret in CODER_NAMESPACE (client-id/client-secret)
 readonly CODER_EXTERNAL_AUTH_APP_NAME="Coder Workspace Git"
 readonly CODER_EXTERNAL_AUTH_SECRET="coder-external-auth"     # k8s secret in CODER_NAMESPACE (client-id/client-secret)
-readonly CODER_CI_USERNAME="coder-ci"
-readonly CODER_CI_SECRET="coder-gitea-ci"                     # EPHEMERAL k8s secret in CODER_NAMESPACE
-readonly CODER_CI_TOKEN_NAME="coder-ci-repo-secret-writer"
-readonly CODER_CI_TOKEN_SCOPES='["write:repository"]'
-readonly CODER_CI_PASSWORD_LENGTH=32
-readonly CODER_SESSION_TOKEN_SECRET_NAME="CODER_SESSION_TOKEN"  # Gitea repo Actions secret published by the Coder Job
+readonly CODER_SESSION_TOKEN_SECRET_NAME="CODER_SESSION_TOKEN"         # Gitea repo Actions secret
+readonly CODER_SESSION_TOKEN_OUT_SECRET="coder-session-token-out"      # EPHEMERAL k8s secret: Job writes the minted Coder key here
+readonly CODER_SESSION_TOKEN_REQUEST_CM="coder-session-token-request"  # k8s ConfigMap marker: presence tells the Job to mint a token
+readonly CODER_SESSION_TOKEN_WAIT_SECS=60                              # bounded wait for the Job to produce the outbox when Coder is already up
 
 readonly ADMIN_TOKEN_SCOPES='["write:repository","write:organization","write:admin","write:user"]' #Scopes for the temporary admin token (write:user needed to manage Coder OAuth2 apps under /user/applications/oauth2)
 readonly ARGOCD_SERVICE_PASSWORD_LENGTH=32
@@ -647,80 +647,74 @@ _ensure_coder_oauth2_secret() {
     log_success "Provisioned OAuth2 app '$app_name' → $ns/$secret_name"
 }
 
-# Provision the EPHEMERAL scoped CI credential (a restricted Gitea user with admin
-# on the cluster-services repo + a write:repository token) and stage it as a k8s
-# secret. The Coder PostSync Job uses it once to publish CODER_SESSION_TOKEN, then
-# revokes the token and deletes this secret — no standing credential is left behind.
+# Publish CODER_SESSION_TOKEN to the cluster-services repo using the Gitea admin
+# token (which never leaves the devenv). The Coder token can only be minted once
+# Coder is up, which happens asynchronously via the PostSync Job — that Job writes
+# the minted key to the outbox secret. This function:
+#   - ensures the request marker exists so the Job knows a token is wanted,
+#   - publishes the outbox key if present (then clears outbox + marker), else
+#   - waits a bounded time when Coder is already up, otherwise defers to the next
+#     apply (greenfield: Coder is not up yet, so nothing sensitive is left behind).
 # Args: namespace org repo api_url admin_token
-_provision_coder_ci_credential() {
+_publish_coder_session_token() {
     local ns="$1" org="$2" repo="$3" api_url="$4" admin_token="$5"
 
-    log_info "Provisioning ephemeral Coder CI credential (user: $CODER_CI_USERNAME)"
-
-    local ci_email="${CODER_CI_USERNAME}@${GITEA_DOMAIN_NAME}"
-    local ci_password
-    ci_password=$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c "$CODER_CI_PASSWORD_LENGTH")
-
-    create_or_ensure_gitea_user "$CODER_CI_USERNAME" "$ci_email" "$ci_password" "$api_url" "$admin_token" || return 1
-    # Gitea gates repo Actions-secret writes behind ownership (reqOwner); a repo admin
-    # collaborator is rejected, so the CI user must be an org owner. De-escalated by
-    # _deprovision_coder_ci_credential once CODER_SESSION_TOKEN is published.
-    add_user_to_org "$org" "$CODER_CI_USERNAME" "$api_url" "$admin_token" || return 1
-
-    local ci_credentials="${CODER_CI_USERNAME}:${ci_password}"
-
-    # Drop any stale token of the same name — its sha is unreadable after creation.
-    local existing_id
-    existing_id=$(curl -k -s -S -u "$ci_credentials" "$api_url/users/$CODER_CI_USERNAME/tokens" \
-        | jq -r --arg n "$CODER_CI_TOKEN_NAME" '.[] | select(.name == $n) | .id' 2>/dev/null | head -n1)
-    if [[ -n "$existing_id" && "$existing_id" != "null" ]]; then
-        delete_gitea_token "$ci_credentials" "$existing_id" "$api_url" || true
-    fi
-
-    local token_result
-    token_result=$(create_gitea_token "$ci_credentials" "$api_url" "$CODER_CI_TOKEN_NAME" "$CODER_CI_TOKEN_SCOPES") || return 1
-    local ci_token_id="${token_result%%|*}"
-    local ci_token="${token_result#*|}"
-    if [[ -z "$ci_token" || "$ci_token" == "$token_result" ]]; then
-        log_error "Failed to mint CI token for $CODER_CI_USERNAME"
-        return 1
-    fi
-
-    # Not ArgoCD-managed (no shell in coderSecretBootstrap.yaml), so client-side apply is safe here.
-    kubectl create secret generic "$CODER_CI_SECRET" -n "$ns" \
-        --from-literal=username="$CODER_CI_USERNAME" \
-        --from-literal=password="$ci_password" \
-        --from-literal=token="$ci_token" \
-        --from-literal=token-id="$ci_token_id" \
-        --from-literal=api-url="$api_url" \
-        --from-literal=org="$org" \
-        --from-literal=repo="$repo" \
+    # Signal the Job (idempotent). Non-sensitive marker — carries no credential.
+    kubectl create configmap "$CODER_SESSION_TOKEN_REQUEST_CM" -n "$ns" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-    kubectl annotate secret "$CODER_CI_SECRET" -n "$ns" \
-        description="EPHEMERAL scoped Gitea CI credential for the Coder PostSync Job to publish CODER_SESSION_TOKEN. Revoked + deleted by the Job after use." \
-        --overwrite &>/dev/null || true
 
-    log_success "Ephemeral Coder CI credential staged: $ns/$CODER_CI_SECRET"
+    if ! kubectl get secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" >/dev/null 2>&1; then
+        # No key yet. Only wait if Coder is actually up; on greenfield it is not,
+        # so defer immediately rather than block the bootstrap for no reason.
+        if ! kubectl -n "$ns" wait --for=condition=Available deployment/coder --timeout=5s >/dev/null 2>&1; then
+            log_info "Coder not yet available — requested a token; CODER_SESSION_TOKEN will publish on a later apply"
+            return 0
+        fi
+        local waited=0
+        while ! kubectl get secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" >/dev/null 2>&1; do
+            if (( waited >= CODER_SESSION_TOKEN_WAIT_SECS )); then
+                log_info "Coder up but token not minted yet — deferring CODER_SESSION_TOKEN publish to the next apply"
+                return 0
+            fi
+            sleep 5
+            waited=$(( waited + 5 ))
+        done
+    fi
+
+    local coder_key
+    coder_key=$(kubectl get secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" \
+        -o jsonpath='{.data.key}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    if [[ -z "$coder_key" ]]; then
+        log_warn "Outbox $ns/$CODER_SESSION_TOKEN_OUT_SECRET has no key; deleting it so the Job re-mints"
+        kubectl delete secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    log_info "Publishing CODER_SESSION_TOKEN to $org/$repo"
+    local put_code
+    put_code=$(curl -k -s -o /dev/null -w '%{http_code}' -X PUT \
+        -H "Authorization: token $admin_token" -H 'Content-Type: application/json' \
+        -d "$(jq -n --arg d "$coder_key" '{data:$d}')" \
+        "$api_url/repos/$org/$repo/actions/secrets/$CODER_SESSION_TOKEN_SECRET_NAME")
+    case "$put_code" in
+        201|204)
+            log_success "Published CODER_SESSION_TOKEN to $org/$repo"
+            _clear_coder_session_token_plumbing "$ns" || true
+            ;;
+        *)
+            log_error "Failed to publish CODER_SESSION_TOKEN (HTTP $put_code)"
+            return 1
+            ;;
+    esac
 }
 
-# De-escalate once CODER_SESSION_TOKEN is published: the Job already revoked the
-# CI token + deleted the k8s secret, so remove the standing org-owner CI user too
-# (honours the "no standing credential" design). Idempotent + non-fatal.
-# Args: namespace org api_url admin_token
-_deprovision_coder_ci_credential() {
-    local ns="$1" org="$2" api_url="$3" admin_token="$4"
-
-    # Belt-and-suspenders: the Job deletes this after publishing, but clean it up
-    # here in case the Job was interrupted after the PUT but before its own cleanup.
-    kubectl delete secret "$CODER_CI_SECRET" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
-
-    local exists
-    exists=$(curl -k -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: token $admin_token" "$api_url/users/$CODER_CI_USERNAME")
-    if [[ "$exists" == "200" ]]; then
-        log_info "CODER_SESSION_TOKEN published — removing standing org-owner CI user '$CODER_CI_USERNAME'"
-        delete_gitea_user "$CODER_CI_USERNAME" "$api_url" "$admin_token" || true
-    fi
+# Remove the token-publish plumbing (outbox secret + request marker) from the
+# coder namespace so no minted key lingers. Idempotent + non-fatal.
+# Args: namespace
+_clear_coder_session_token_plumbing() {
+    local ns="$1"
+    kubectl delete secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
+    kubectl delete configmap "$CODER_SESSION_TOKEN_REQUEST_CM" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
 }
 
 # Top-level Coder ↔ Gitea provisioning. No-op unless Coder is rendered for this env.
@@ -755,12 +749,12 @@ setup_coder_gitea_integration() {
         "https://${CODER_DOMAIN_NAME}/external-auth/gitea/callback" \
         "$CODER_EXTERNAL_AUTH_SECRET" "$ns" "$gitea_api_url" "$admin_token" || return 1
 
-    # Only stage the ephemeral CI credential if the token has not been published yet.
+    # Publish CODER_SESSION_TOKEN once, self-healing if the repo secret is deleted.
     if gitea_repo_secret_exists "$org" "$repo" "$CODER_SESSION_TOKEN_SECRET_NAME" "$gitea_api_url" "$admin_token"; then
-        log_info "CODER_SESSION_TOKEN already published to $org/$repo — skipping ephemeral CI credential"
-        _deprovision_coder_ci_credential "$ns" "$org" "$gitea_api_url" "$admin_token" || true
+        log_info "CODER_SESSION_TOKEN already published to $org/$repo — clearing any leftover publish plumbing"
+        _clear_coder_session_token_plumbing "$ns" || true
     else
-        _provision_coder_ci_credential "$ns" "$org" "$repo" "$gitea_api_url" "$admin_token" || return 1
+        _publish_coder_session_token "$ns" "$org" "$repo" "$gitea_api_url" "$admin_token" || return 1
     fi
 
     log_success "Coder ↔ Gitea integration ready"
