@@ -69,17 +69,16 @@ readonly REGISTRY_PULL_PASSWORD_LENGTH=32
 
 # Coder ↔ Gitea integration. Two persistent OAuth2 apps (runtime login + workspace
 # git external-auth). CODER_SESSION_TOKEN is published to the repo with the Gitea
-# admin token (which never leaves the devenv): the Coder PostSync Job mints the
-# Coder token into an outbox secret and this script performs the Gitea write, so
-# no Gitea credential is ever staged into the coder namespace.
+# admin token (which never leaves the devenv): this script execs the Coder pod to
+# mint a Coder API token, then performs the Gitea write, so no Gitea credential is
+# ever staged into the coder namespace.
 readonly CODER_OIDC_APP_NAME="Coder OIDC Login"
 readonly CODER_OIDC_SECRET="coder-oidc"                       # k8s secret in CODER_NAMESPACE (client-id/client-secret)
 readonly CODER_EXTERNAL_AUTH_APP_NAME="Coder Workspace Git"
 readonly CODER_EXTERNAL_AUTH_SECRET="coder-external-auth"     # k8s secret in CODER_NAMESPACE (client-id/client-secret)
 readonly CODER_SESSION_TOKEN_SECRET_NAME="CODER_SESSION_TOKEN"         # Gitea repo Actions secret
-readonly CODER_SESSION_TOKEN_OUT_SECRET="coder-session-token-out"      # EPHEMERAL k8s secret: Job writes the minted Coder key here
-readonly CODER_SESSION_TOKEN_REQUEST_CM="coder-session-token-request"  # k8s ConfigMap marker: presence tells the Job to mint a token
-readonly CODER_SESSION_TOKEN_WAIT_SECS=60                              # bounded wait for the Job to produce the outbox when Coder is already up
+readonly CODER_TOKEN_NAME="gitea-ci-templates"                        # Coder API token name minted for CI
+readonly CODER_DEPLOY_WAIT_SECS=600                                   # bounded wait for the Coder Deployment to become Available before minting
 
 readonly ADMIN_TOKEN_SCOPES='["write:repository","write:organization","write:admin","write:user"]' #Scopes for the temporary admin token (write:user needed to manage Coder OAuth2 apps under /user/applications/oauth2)
 readonly ARGOCD_SERVICE_PASSWORD_LENGTH=32
@@ -100,6 +99,7 @@ Arguments:
   --force-recreate-gitea-org       Delete and recreate organization and repository if they exist
   --force-recreate-argocd-svc-user Delete and recreate ArgoCD service account user and secrets
   --coder-integration-only         Only (re)provision the Coder <-> Gitea secrets, then exit (idempotent; used on every apply)
+  --coder-token-only               Only mint + publish CODER_SESSION_TOKEN (waits for Coder, skips if already published), then exit
 
 Requirements:
   - kubectl
@@ -228,7 +228,7 @@ main() {
     local force_recreate_gitea_org="false"
     local force_recreate_argocd_svc_user="false"
     local coder_integration_only="false"
-    
+    local coder_token_only="false"
     # Parse optional flags
     shift  # Remove first argument (env_file)
     while [[ $# -gt 0 ]]; do
@@ -249,6 +249,14 @@ main() {
                 # external-auth secrets are populated even when Gitea is already
                 # bootstrapped (the full main() flow is skipped in that case).
                 coder_integration_only="true"
+                shift
+                ;;
+            --coder-token-only)
+                # Publish-only path: mint + publish CODER_SESSION_TOKEN. Called at
+                # the end of cluster-bootstrap.sh after the Coder ArgoCD app is
+                # applied, so greenfield publishes in the same run. Waits for Coder
+                # to become Available and skips when the repo secret already exists.
+                coder_token_only="true"
                 shift
                 ;;
             *)
@@ -343,6 +351,17 @@ main() {
         fi
         echo ""
         log_success "Coder ↔ Gitea integration complete (coder-integration-only mode)"
+        return 0
+    fi
+
+    # Publish-only fast path: mint + publish CODER_SESSION_TOKEN, then exit.
+    if [[ "$coder_token_only" == "true" ]]; then
+        if ! setup_coder_gitea_token_publish "$gitea_api_url" "$token"; then
+            log_error "Failed to publish CODER_SESSION_TOKEN"
+            exit 1
+        fi
+        echo ""
+        log_success "CODER_SESSION_TOKEN publish complete (coder-token-only mode)"
         return 0
     fi
 
@@ -586,6 +605,12 @@ main() {
     fi
     echo ""
 
+    # Publish CODER_SESSION_TOKEN if Coder is already up; defers safely otherwise
+    # so a standalone run reaches parity with cluster-bootstrap's end-of-run step.
+    setup_coder_gitea_token_publish "$gitea_api_url" "$token" || \
+        log_warn "CODER_SESSION_TOKEN publish deferred to the next apply"
+    echo ""
+
     # Summary
     log_success \"Gitea bootstrap complete!\"
     log_info \"Organization: $GITEA_CLUSTER_GITEA_ORG_NAME\"
@@ -647,74 +672,75 @@ _ensure_coder_oauth2_secret() {
     log_success "Provisioned OAuth2 app '$app_name' → $ns/$secret_name"
 }
 
+# Mint a Coder API token by exec-ing the Coder pod (curl login + coder CLI). Echoes
+# the raw token on stdout, or nothing on failure. Reads the owner credentials the
+# owner-bootstrap Job stored in coder-owner-bootstrap. No Gitea credential involved.
+# Args: namespace
+_mint_coder_session_token() {
+    local ns="$1"
+    local email pw
+    email=$(kubectl -n "$ns" get secret coder-owner-bootstrap -o jsonpath='{.data.email}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    pw=$(kubectl -n "$ns" get secret coder-owner-bootstrap -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    if [[ -z "$email" || -z "$pw" ]]; then
+        log_warn "Owner credentials not present in $ns/coder-owner-bootstrap yet — cannot mint Coder token" >&2
+        return 1
+    fi
+
+    # One in-pod script: API login for a session token, drop any stale token of the
+    # same name (so create cannot 409), then mint. Only the token reaches stdout.
+    # Owner credentials are fed on stdin (read OE/OP) so they never appear in argv.
+    local out
+    out=$(printf '%s\n%s\n' "$email" "$pw" | kubectl -n "$ns" exec -i deploy/coder -- \
+        env TN="$CODER_TOKEN_NAME" sh -c '
+            set -eu
+            IFS= read -r OE
+            IFS= read -r OP
+            URL=http://localhost:8080
+            sess=$(curl -fsS -X POST -H "Content-Type: application/json" \
+                -d "{\"email\":\"$OE\",\"password\":\"$OP\"}" "$URL/api/v2/users/login" \
+                | tr "," "\n" | sed -n "s/.*\"session_token\":\"\([^\"]*\)\".*/\1/p")
+            [ -n "$sess" ] || { echo "coder owner login failed" >&2; exit 1; }
+            export CODER_URL="$URL" CODER_SESSION_TOKEN="$sess"
+            for id in $(coder tokens ls -c id,name 2>/dev/null | awk -v n="$TN" "NR>1 && \$2==n{print \$1}"); do
+                coder tokens rm --delete "$id" >/dev/null 2>&1 || true
+            done
+            coder tokens create --name "$TN"
+        ') || return 1
+
+    # The minted token is the last non-empty stdout line.
+    printf '%s' "$out" | awk 'NF{last=$0} END{if (last) print last}'
+}
+
 # Publish CODER_SESSION_TOKEN to the cluster-services repo using the Gitea admin
-# token (which never leaves the devenv). The Coder token can only be minted once
-# Coder is up, which happens asynchronously via the PostSync Job — that Job writes
-# the minted key to the outbox secret. This function:
-#   - ensures the request marker exists so the Job knows a token is wanted,
-#   - publishes the outbox key if present (then clears outbox + marker), else
-#   - waits a bounded time when Coder is already up, otherwise defers to the next
-#     apply (greenfield: Coder is not up yet, so nothing sensitive is left behind).
+# token (which never leaves the devenv). Skips when the repo secret already exists;
+# otherwise waits for the Coder Deployment to become Available, mints a token via
+# the Coder pod, and PUTs it. Defers (returns 0) if Coder never comes up or the
+# owner credentials are not ready yet — the next apply self-heals.
 # Args: namespace org repo api_url admin_token
 _publish_coder_session_token() {
     local ns="$1" org="$2" repo="$3" api_url="$4" admin_token="$5"
 
-    # Signal the Job (idempotent). Non-sensitive marker — carries no credential.
-    kubectl create configmap "$CODER_SESSION_TOKEN_REQUEST_CM" -n "$ns" \
-        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-
-    if ! kubectl get secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" >/dev/null 2>&1; then
-        # No key yet. Only wait if Coder is actually up; on greenfield it is not,
-        # so defer immediately rather than block the bootstrap for no reason.
-        if ! kubectl -n "$ns" wait --for=condition=Available deployment/coder --timeout=5s >/dev/null 2>&1; then
-            log_info "Coder not yet available — requested a token; CODER_SESSION_TOKEN will publish on a later apply"
-            return 0
-        fi
-        local waited=0
-        while ! kubectl get secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" >/dev/null 2>&1; do
-            if (( waited >= CODER_SESSION_TOKEN_WAIT_SECS )); then
-                log_info "Coder up but token not minted yet — deferring CODER_SESSION_TOKEN publish to the next apply"
-                return 0
-            fi
-            sleep 5
-            waited=$(( waited + 5 ))
-        done
-    fi
-
-    local coder_key
-    coder_key=$(kubectl get secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" \
-        -o jsonpath='{.data.key}' 2>/dev/null | base64 -d 2>/dev/null || true)
-    if [[ -z "$coder_key" ]]; then
-        log_warn "Outbox $ns/$CODER_SESSION_TOKEN_OUT_SECRET has no key; deleting it so the Job re-mints"
-        kubectl delete secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
+    if gitea_repo_secret_exists "$org" "$repo" "$CODER_SESSION_TOKEN_SECRET_NAME" "$api_url" "$admin_token"; then
+        log_info "CODER_SESSION_TOKEN already published to $org/$repo — nothing to do"
         return 0
     fi
 
-    log_info "Publishing CODER_SESSION_TOKEN to $org/$repo"
-    local put_code
-    put_code=$(curl -k -s -o /dev/null -w '%{http_code}' -X PUT \
-        -H "Authorization: token $admin_token" -H 'Content-Type: application/json' \
-        -d "$(jq -n --arg d "$coder_key" '{data:$d}')" \
-        "$api_url/repos/$org/$repo/actions/secrets/$CODER_SESSION_TOKEN_SECRET_NAME")
-    case "$put_code" in
-        201|204)
-            log_success "Published CODER_SESSION_TOKEN to $org/$repo"
-            _clear_coder_session_token_plumbing "$ns" || true
-            ;;
-        *)
-            log_error "Failed to publish CODER_SESSION_TOKEN (HTTP $put_code)"
-            return 1
-            ;;
-    esac
-}
+    log_info "Waiting up to ${CODER_DEPLOY_WAIT_SECS}s for the Coder deployment to become Available..."
+    if ! kubectl -n "$ns" wait --for=condition=Available deployment/coder \
+        --timeout="${CODER_DEPLOY_WAIT_SECS}s" >/dev/null 2>&1; then
+        log_info "Coder not Available in time — deferring CODER_SESSION_TOKEN publish to the next apply"
+        return 0
+    fi
 
-# Remove the token-publish plumbing (outbox secret + request marker) from the
-# coder namespace so no minted key lingers. Idempotent + non-fatal.
-# Args: namespace
-_clear_coder_session_token_plumbing() {
-    local ns="$1"
-    kubectl delete secret "$CODER_SESSION_TOKEN_OUT_SECRET" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
-    kubectl delete configmap "$CODER_SESSION_TOKEN_REQUEST_CM" -n "$ns" --ignore-not-found >/dev/null 2>&1 || true
+    local coder_key
+    coder_key=$(_mint_coder_session_token "$ns") || true
+    if [[ -z "$coder_key" ]]; then
+        log_warn "Could not mint a Coder API token — deferring CODER_SESSION_TOKEN publish to the next apply"
+        return 0
+    fi
+
+    set_gitea_repo_secret "$org" "$repo" "$CODER_SESSION_TOKEN_SECRET_NAME" \
+        "$coder_key" "$api_url" "$admin_token" || return 1
 }
 
 # Top-level Coder ↔ Gitea provisioning. No-op unless Coder is rendered for this env.
@@ -732,10 +758,8 @@ setup_coder_gitea_integration() {
     fi
 
     local ns="${CODER_NAMESPACE:-coder}"
-    local org="$GITEA_CLUSTER_GITEA_ORG_NAME"
-    local repo="$GITEA_CLUSTER_SERVICES_REPO_NAME"
 
-    log_info "Setting up Coder ↔ Gitea integration (namespace: $ns)"
+    log_info "Setting up Coder ↔ Gitea integration secrets (namespace: $ns)"
 
     # The coder namespace is created by ArgoCD slightly later; create it now
     # (idempotently) so the secrets can be staged. ArgoCD adopts it on sync.
@@ -749,14 +773,29 @@ setup_coder_gitea_integration() {
         "https://${CODER_DOMAIN_NAME}/external-auth/gitea/callback" \
         "$CODER_EXTERNAL_AUTH_SECRET" "$ns" "$gitea_api_url" "$admin_token" || return 1
 
-    # Publish CODER_SESSION_TOKEN once, self-healing if the repo secret is deleted.
-    if gitea_repo_secret_exists "$org" "$repo" "$CODER_SESSION_TOKEN_SECRET_NAME" "$gitea_api_url" "$admin_token"; then
-        log_info "CODER_SESSION_TOKEN already published to $org/$repo — clearing any leftover publish plumbing"
-        _clear_coder_session_token_plumbing "$ns" || true
-    else
-        _publish_coder_session_token "$ns" "$org" "$repo" "$gitea_api_url" "$admin_token" || return 1
+    log_success "Coder ↔ Gitea integration secrets ready"
+}
+
+# Publish-only path: mint a Coder API token via the Coder pod and PUT it to Gitea.
+# No-op unless Coder is rendered and CODER_DOMAIN_NAME is set. Invoked at the end of
+# cluster-bootstrap.sh (after the Coder ArgoCD app is applied) so greenfield
+# publishes in the same run.
+# Args: gitea_api_url admin_token
+setup_coder_gitea_token_publish() {
+    local gitea_api_url="$1" admin_token="$2"
+
+    if [[ ! -d "$OVERLAY_DIR/_rendered/coder" ]]; then
+        log_info "Coder not rendered for this environment — skipping CODER_SESSION_TOKEN publish"
+        return 0
+    fi
+    if [[ -z "${CODER_DOMAIN_NAME:-}" ]]; then
+        log_warn "CODER_DOMAIN_NAME is unset but Coder is rendered — skipping CODER_SESSION_TOKEN publish"
+        return 0
     fi
 
-    log_success "Coder ↔ Gitea integration ready"
+    local ns="${CODER_NAMESPACE:-coder}"
+    _publish_coder_session_token "$ns" \
+        "$GITEA_CLUSTER_GITEA_ORG_NAME" "$GITEA_CLUSTER_SERVICES_REPO_NAME" \
+        "$gitea_api_url" "$admin_token"
 }
 main "$@"

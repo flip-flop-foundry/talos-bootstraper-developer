@@ -427,6 +427,16 @@ for manifest in "$RENDERED_OVERLAY_DIR"/*/*.yaml; do
 done
 
 # ============================================================================
+# CODER SESSION TOKEN (greenfield: publish in the same run)
+# ============================================================================
+# The Coder ArgoCD app was just applied; wait for Coder to become Available and
+# publish CODER_SESSION_TOKEN to Gitea now, so greenfield needs no second apply.
+# No-ops when Coder is not rendered or the repo secret already exists; defers to
+# the next apply if Coder does not come up in time.
+log_info "Publishing CODER_SESSION_TOKEN (waits for Coder; no-op if already published)..."
+"$SCRIPT_DIR/gitea-bootstrap.sh" "$env_name" --coder-token-only || log_warn "CODER_SESSION_TOKEN publish deferred to next apply"
+
+# ============================================================================
 # CLEANUP
 # ============================================================================
 
