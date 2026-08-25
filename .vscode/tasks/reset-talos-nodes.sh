@@ -86,8 +86,6 @@ fi
 echo ""
 echo "Resetting nodes: $NODE_LIST"
 talosctl reset \
-  --system-labels-to-wipe STATE \
-  --system-labels-to-wipe EPHEMERAL \
   --talosconfig "$TALOSCONFIG" \
   --graceful=false \
   --reboot=true \

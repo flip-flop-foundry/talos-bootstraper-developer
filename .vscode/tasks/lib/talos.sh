@@ -31,19 +31,34 @@ generate_node_config() {
   local node_patch="$overlay_dir/talos/nodes/${node_hostname}.yaml"
   if [[ -f "$node_patch" ]]; then
     log_info "  Applying per-node patch: $node_patch"
-    local tmp_main tmp_rest tmp_merged
+    local tmp_main tmp_rest tmp_merged tmp_patch_main tmp_patch_rest
     tmp_main=$(mktemp)
     tmp_rest=$(mktemp)
     tmp_merged=$(mktemp)
+    tmp_patch_main=$(mktemp)
+    tmp_patch_rest=$(mktemp)
+
     yq 'select(di == 0)' "$config_file" > "$tmp_main"
     yq 'select(di > 0)' "$config_file" > "$tmp_rest"
-    yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' "$tmp_main" "$node_patch" > "$tmp_merged"
+    yq 'select(di == 0)' "$node_patch" > "$tmp_patch_main"
+    yq 'select(di > 0)' "$node_patch" > "$tmp_patch_rest"
+
+    yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' "$tmp_main" "$tmp_patch_main" > "$tmp_merged"
+
     cat "$tmp_merged" > "$config_file"
+
     if [[ -s "$tmp_rest" ]]; then
       echo "---" >> "$config_file"
       cat "$tmp_rest" >> "$config_file"
     fi
-    rm -f "$tmp_main" "$tmp_rest" "$tmp_merged"
+
+    # Append additional documents from the per-node patch (e.g. LinkConfig).
+    if [[ -s "$tmp_patch_rest" ]]; then
+      echo "---" >> "$config_file"
+      cat "$tmp_patch_rest" >> "$config_file"
+    fi
+
+    rm -f "$tmp_main" "$tmp_rest" "$tmp_merged" "$tmp_patch_main" "$tmp_patch_rest"
   fi
 
   # Disk detection — pass config_file so that maintenance-mode nodes can resolve

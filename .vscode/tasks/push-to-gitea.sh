@@ -92,7 +92,7 @@ git -C "$tmp_repo" add -A -- _rendered/
 
 # --- mirror generated Gitea Actions workflows (.gitea/workflows/) if present ---
 # render-overlay.sh flattens component workflows into <env>/.gitea/workflows/.
-# We mirror ONLY that subdirectory into the Gitea repo, never the rest of
+# We mirror ONLY the workflows subdirectory into the Gitea repo, never the rest of
 # .gitea/ (which may hold hand-maintained Gitea config we must not clobber).
 # Two cases:
 #   - local workflows dir present -> rsync --delete so the remote exactly matches
