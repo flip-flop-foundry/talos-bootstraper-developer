@@ -405,8 +405,45 @@ restore_longhorn_drain_policy() {
   kubectl patch settings.longhorn.io node-drain-policy -n longhorn-system \
     --type merge -p "{\"value\":\"$restore_longhorn_policy\"}" >/dev/null ||
     printf '[talos-upgrade] WARNING: failed to restore Longhorn node-drain-policy to %s\n' "$restore_longhorn_policy" >&2
-  log 'Remember to re-enable ArgoCD auto-sync for the Longhorn application.'
   restore_longhorn_policy=""
+}
+
+# A merge patch that nulls spec.syncPolicy.automated leaves the rest of syncPolicy intact.
+declare -A restore_argocd_automated=()
+pause_argocd_autosync() {
+  local app namespace name automated
+  for app in "$@"; do
+    namespace="${app%%/*}"
+    name="${app##*/}"
+    automated=$(kubectl -n "$namespace" get application "$name" -o json 2>/dev/null |
+      jq -c '.spec.syncPolicy.automated') || automated=''
+    [[ -n "$automated" && "$automated" != null ]] || continue
+    log "Pausing ArgoCD auto-sync for $app"
+    kubectl -n "$namespace" patch application "$name" --type merge \
+      -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null ||
+      fail "failed to pause ArgoCD auto-sync for $app"
+    restore_argocd_automated["$app"]="$automated"
+  done
+}
+
+restore_argocd_autosync() {
+  [[ ${#restore_argocd_automated[@]} -gt 0 ]] || return 0
+  local app namespace name
+  for app in "${!restore_argocd_automated[@]}"; do
+    namespace="${app%%/*}"
+    name="${app##*/}"
+    log "Re-enabling ArgoCD auto-sync for $app"
+    kubectl -n "$namespace" patch application "$name" --type merge \
+      -p "{\"spec\":{\"syncPolicy\":{\"automated\":${restore_argocd_automated[$app]}}}}" >/dev/null ||
+      printf '[talos-upgrade] WARNING: failed to re-enable ArgoCD auto-sync for %s\n' "$app" >&2
+  done
+  restore_argocd_automated=()
+}
+
+# Restore the drain policy first so ArgoCD reconciles against the original value.
+cleanup() {
+  restore_longhorn_drain_policy
+  restore_argocd_autosync
 }
 
 normalize_version() {
@@ -713,7 +750,7 @@ ask "Type the cluster name ($TALOS_CLUSTER_NAME) to continue: " typed_cluster_na
 [[ -n "$typed_cluster_name" && "$typed_cluster_name" == "$TALOS_CLUSTER_NAME" ]] ||
   fail 'cluster name confirmation did not match'
 
-trap restore_longhorn_drain_policy EXIT
+trap cleanup EXIT
 trap 'fail "interrupted by signal"' INT TERM
 
 log 'Pre-flight: etcd health'
@@ -751,26 +788,25 @@ if [[ -n "$current_drain_policy" ]]; then
       policy_switched=false
       if confirm 'Temporarily switch node-drain-policy to block-for-eviction-if-contains-last-replica (restored on exit)?'; then
         autosync_apps=$(longhorn_argocd_autosync) || autosync_apps=''
+        argocd_ready=true
         if [[ -n "$autosync_apps" ]]; then
-          printf '\nArgoCD auto-sync is STILL ENABLED on: %s\n' "$autosync_apps"
-          printf 'It will revert this patch mid-upgrade and the drain will then block. Pause it first:\n'
-          read -ra autosync_app_list <<<"$autosync_apps"
-          for app in "${autosync_app_list[@]}"; do
-            printf "  kubectl -n %s patch application %s --type merge -p '{\"spec\":{\"syncPolicy\":{\"automated\":null}}}'\n" \
-              "${app%%/*}" "${app##*/}"
-          done
-        else
-          printf '\nNo Longhorn ArgoCD application currently reports automated sync.\n'
+          printf '\nArgoCD auto-sync is enabled on: %s\n' "$autosync_apps"
+          printf 'It would revert the drain-policy patch mid-upgrade and the drain would then block.\n'
+          if confirm 'Pause ArgoCD auto-sync for those applications now (re-enabled automatically on exit)?'; then
+            read -ra autosync_app_list <<<"$autosync_apps"
+            pause_argocd_autosync "${autosync_app_list[@]}"
+          else
+            argocd_ready=false
+            log 'ArgoCD left running; not switching the drain policy because the patch would be reverted.'
+          fi
         fi
-        if confirm 'Has ArgoCD auto-sync been paused for Longhorn?'; then
+        if [[ "$argocd_ready" == true ]]; then
           kubectl patch settings.longhorn.io node-drain-policy -n longhorn-system \
             --type merge -p '{"value":"block-for-eviction-if-contains-last-replica"}' >/dev/null ||
             fail 'failed to update the Longhorn node-drain-policy'
           restore_longhorn_policy="$current_drain_policy"
           policy_switched=true
           log 'Longhorn will now relocate last replicas automatically; expect considerably longer drains.'
-        else
-          log 'Leaving the policy unchanged: ArgoCD would revert it mid-upgrade anyway.'
         fi
       fi
       if [[ "$policy_switched" == false ]]; then
@@ -852,7 +888,7 @@ for node in "${upgrade_order[@]}"; do
   log "$node upgraded and validated."
 done
 
-restore_longhorn_drain_policy
+cleanup
 
 printf '\n────────────────────────────────────────────────────────────\n'
 printf '  Final cluster validation\n'
