@@ -120,13 +120,20 @@ ask() {
   if ! IFS= read -r -p "$_ask_prompt" _ask_reply; then
     fail 'no input available on stdin; run this task from an interactive terminal'
   fi
+  # Terminals and pasted input add carriage returns and stray spaces that are invisible on screen.
+  _ask_reply="${_ask_reply#"${_ask_reply%%[![:space:]]*}"}"
+  _ask_reply="${_ask_reply%"${_ask_reply##*[![:space:]]}"}"
   printf -v "$_ask_varname" '%s' "$_ask_reply"
 }
 
 confirm() {
   local _confirm_reply
   ask "$1 [y/N] " _confirm_reply
-  [[ "$_confirm_reply" =~ ^[Yy]$ ]]
+  if [[ "$_confirm_reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+    return 0
+  fi
+  [[ "$_confirm_reply" =~ ^([Nn][Oo]?)?$ ]] || log "Read '$_confirm_reply' as a no."
+  return 1
 }
 
 # Gate for any command that mutates a node. Always prompts when interactive=true.
@@ -263,28 +270,60 @@ crd_present() {
   return 2
 }
 
-# Rebooting a node degrades every Longhorn volume that had a replica on it. Moving to
-# the next node before the rebuild finishes can take the last healthy replica offline.
+# Lists "<volume> <robustness>" for volumes that are not healthy. Given a node, only
+# volumes with a live replica on that node are reported.
+longhorn_unhealthy_volumes() {
+  local target_node="${1:-}" volumes_json replicas_json scope='null'
+
+  volumes_json=$(kubectl -n longhorn-system get volumes.longhorn.io -o json 2>/dev/null) ||
+    { log 'longhorn: unable to query volume robustness'; return 1; }
+
+  if [[ -n "$target_node" ]]; then
+    replicas_json=$(kubectl -n longhorn-system get replicas.longhorn.io -o json 2>/dev/null) ||
+      { log 'longhorn: unable to query replica placement'; return 1; }
+    # failedAt marks a replica Longhorn has already written off, so it is not at risk here.
+    scope=$(jq -c --arg node "$target_node" \
+      '[.items[] | select(.spec.nodeID == $node and (.spec.failedAt // "") == "") | .spec.volumeName]' \
+      <<<"$replicas_json") ||
+      { log 'longhorn: unable to parse replica placement'; return 1; }
+  fi
+
+  jq -r --argjson scope "$scope" '
+    .items[]
+    | select(.status.robustness != "healthy" and .status.robustness != "" and .status.robustness != null)
+    | . as $volume
+    | select($scope == null or ($scope | index($volume.metadata.name) != null))
+    | "\($volume.metadata.name) \($volume.status.robustness)"' <<<"$volumes_json" ||
+    { log 'longhorn: unable to parse volume robustness'; return 1; }
+}
+
+# Rebooting a node takes its replicas offline, so a volume that is already degraded and has
+# a replica here can drop below a safe replica count. Volumes rebuilding on other nodes are
+# unaffected by this node, so don't block on them.
 wait_for_longhorn_healthy() {
-  local deadline degraded crd_rc=0
+  local target_node="${1:-}" deadline unhealthy count scope_label volume_line crd_rc=0
   crd_present volumes.longhorn.io || crd_rc=$?
   [[ "$crd_rc" -eq 1 ]] && return 0
   [[ "$crd_rc" -eq 0 ]] || return 1
+  if [[ -n "$target_node" ]]; then
+    scope_label="with a replica on $target_node"
+  else
+    scope_label='in the cluster'
+  fi
   deadline=$(( $(date +%s) + STORAGE_SETTLE_TIMEOUT ))
   while true; do
-    degraded=$(kubectl -n longhorn-system get volumes.longhorn.io -o json 2>/dev/null |
-      jq -r '[.items[] | select(.status.robustness != "healthy" and .status.robustness != "" and .status.robustness != null)] | length') ||
-      { log 'longhorn: unable to query volume robustness'; return 1; }
-    if [[ "${degraded:-1}" == 0 ]]; then
+    unhealthy=$(longhorn_unhealthy_volumes "$target_node") || return 1
+    if [[ -z "$unhealthy" ]]; then
       return 0
     fi
+    count=$(wc -l <<<"$unhealthy")
     if [[ $(date +%s) -ge $deadline ]]; then
-      log "longhorn: $degraded volume(s) still degraded after ${STORAGE_SETTLE_TIMEOUT}s"
-      kubectl -n longhorn-system get volumes.longhorn.io -o json 2>/dev/null |
-        jq -r '.items[] | select(.status.robustness != "healthy" and .status.robustness != "" and .status.robustness != null) | "    \(.metadata.name) \(.status.robustness)"' || true
+      log "longhorn: $count volume(s) $scope_label still degraded after ${STORAGE_SETTLE_TIMEOUT}s"
+      while IFS= read -r volume_line; do log "  $volume_line"; done <<<"$unhealthy"
       return 1
     fi
-    log "longhorn: waiting for $degraded volume(s) to finish rebuilding..."
+    log "longhorn: waiting for $count volume(s) $scope_label to finish rebuilding"
+    while IFS= read -r volume_line; do log "  $volume_line"; done <<<"$unhealthy"
     sleep 15
   done
 }
@@ -723,7 +762,7 @@ if [[ "$read_only" == true ]]; then
     printf '  [%-12s] %s\n' "${node_role[$node]}" "$(upgrade_command "$node")"
   done
   printf '\nValidation the live run performs:\n'
-  printf '  before each node   etcd quorum, Kubernetes nodes Ready, Longhorn volumes healthy, CNPG fully replicated\n'
+  printf '  before each node   etcd quorum, Kubernetes nodes Ready, Longhorn volumes with a replica on that node healthy, CNPG fully replicated\n'
   printf '  after each node    node reports %s and running+ready, etcd quorum, Kubernetes nodes Ready\n' "$selected_target"
   printf '  once at the end    all of the above plus talosctl health across control-plane and worker nodes\n'
   printf '  before it starts   every target installer image is confirmed to exist in the Image Factory\n'
@@ -823,17 +862,19 @@ for node in "${upgrade_order[@]}"; do
   printf '  %s (%s): %s -> %s\n' "$node" "${node_role[$node]}" "${node_version[$node]}" "$selected_target"
   printf '────────────────────────────────────────────────────────────\n'
 
+  node_short="$(k8s_name "$node")"
+
   log 'Checking etcd quorum before touching this node'
   check_etcd_health || fail "etcd became unhealthy before upgrading $node; aborting"
   log 'Checking Kubernetes node readiness'
   wait_for_cluster_settled || fail "the Kubernetes cluster became unhealthy before upgrading $node; aborting"
-  log 'Checking Longhorn volume robustness'
-  wait_for_longhorn_healthy || fail "Longhorn volumes are still degraded before upgrading $node; aborting"
+  log "Checking Longhorn volumes with a replica on $node_short"
+  wait_for_longhorn_healthy "$node_short" ||
+    fail "Longhorn volumes with a replica on $node are still degraded; aborting"
   log 'Checking CloudNativePG replication'
   wait_for_cnpg_healthy || fail "CloudNativePG clusters are not fully replicated before upgrading $node; aborting"
 
   # Replica placement shifts as earlier nodes are drained, so re-evaluate per node.
-  node_short="$(k8s_name "$node")"
   node_blockers=()
   node_replica_output=$(longhorn_last_replica_nodes) ||
     fail "unable to query Longhorn replica placement before upgrading $node"
