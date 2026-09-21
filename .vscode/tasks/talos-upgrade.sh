@@ -385,6 +385,19 @@ longhorn_drain_policy() {
   kubectl get settings.longhorn.io node-drain-policy -n longhorn-system -o jsonpath='{.value}' 2>/dev/null || true
 }
 
+# Lists "<namespace>/<name>" for Longhorn ArgoCD applications that still have automated
+# sync, because those will revert a drain-policy patch mid-upgrade.
+longhorn_argocd_autosync() {
+  local crd_rc=0
+  crd_present applications.argoproj.io || crd_rc=$?
+  [[ "$crd_rc" -eq 0 ]] || return 1
+  kubectl get applications.argoproj.io -A -o json 2>/dev/null |
+    jq -r '[.items[]
+            | select(.metadata.name | test("longhorn"; "i"))
+            | select(.spec.syncPolicy.automated != null)
+            | "\(.metadata.namespace)/\(.metadata.name)"] | join(" ")'
+}
+
 restore_longhorn_policy=""
 restore_longhorn_drain_policy() {
   [[ -n "$restore_longhorn_policy" ]] || return 0
@@ -392,6 +405,7 @@ restore_longhorn_drain_policy() {
   kubectl patch settings.longhorn.io node-drain-policy -n longhorn-system \
     --type merge -p "{\"value\":\"$restore_longhorn_policy\"}" >/dev/null ||
     printf '[talos-upgrade] WARNING: failed to restore Longhorn node-drain-policy to %s\n' "$restore_longhorn_policy" >&2
+  log 'Remember to re-enable ArgoCD auto-sync for the Longhorn application.'
   restore_longhorn_policy=""
 }
 
@@ -733,16 +747,36 @@ if [[ -n "$current_drain_policy" ]]; then
       "$current_drain_policy"
     if [[ "$current_drain_policy" == block-for-eviction* ]]; then
       log 'Policy already evicts replicas automatically; drains will be slow but will complete.'
-    elif confirm 'Temporarily switch node-drain-policy to block-for-eviction-if-contains-last-replica (restored on exit)?'; then
-      kubectl patch settings.longhorn.io node-drain-policy -n longhorn-system \
-        --type merge -p '{"value":"block-for-eviction-if-contains-last-replica"}' >/dev/null ||
-        fail 'failed to update the Longhorn node-drain-policy'
-      restore_longhorn_policy="$current_drain_policy"
-      log 'Longhorn will now relocate last replicas automatically; expect considerably longer drains.'
-      log 'Longhorn is ArgoCD-managed: if the app re-syncs mid-upgrade the policy may revert, which shows up as a blocked drain. Consider pausing auto-sync for the Longhorn application.'
     else
-      confirm 'Continue anyway (a drain may block until the drain timeout and abort the upgrade)?' ||
-        fail 'operator aborted at the Longhorn pre-flight'
+      policy_switched=false
+      if confirm 'Temporarily switch node-drain-policy to block-for-eviction-if-contains-last-replica (restored on exit)?'; then
+        autosync_apps=$(longhorn_argocd_autosync) || autosync_apps=''
+        if [[ -n "$autosync_apps" ]]; then
+          printf '\nArgoCD auto-sync is STILL ENABLED on: %s\n' "$autosync_apps"
+          printf 'It will revert this patch mid-upgrade and the drain will then block. Pause it first:\n'
+          read -ra autosync_app_list <<<"$autosync_apps"
+          for app in "${autosync_app_list[@]}"; do
+            printf "  kubectl -n %s patch application %s --type merge -p '{\"spec\":{\"syncPolicy\":{\"automated\":null}}}'\n" \
+              "${app%%/*}" "${app##*/}"
+          done
+        else
+          printf '\nNo Longhorn ArgoCD application currently reports automated sync.\n'
+        fi
+        if confirm 'Has ArgoCD auto-sync been paused for Longhorn?'; then
+          kubectl patch settings.longhorn.io node-drain-policy -n longhorn-system \
+            --type merge -p '{"value":"block-for-eviction-if-contains-last-replica"}' >/dev/null ||
+            fail 'failed to update the Longhorn node-drain-policy'
+          restore_longhorn_policy="$current_drain_policy"
+          policy_switched=true
+          log 'Longhorn will now relocate last replicas automatically; expect considerably longer drains.'
+        else
+          log 'Leaving the policy unchanged: ArgoCD would revert it mid-upgrade anyway.'
+        fi
+      fi
+      if [[ "$policy_switched" == false ]]; then
+        confirm 'Continue anyway (a drain may block until the drain timeout and abort the upgrade)?' ||
+          fail 'operator aborted at the Longhorn pre-flight'
+      fi
     fi
   fi
 fi
