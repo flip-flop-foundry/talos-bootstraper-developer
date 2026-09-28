@@ -10,15 +10,16 @@ set -euo pipefail
 # Bootstraps a new customer on the cluster:
 #   1. Creates a Gitea organisation for the customer
 #   2. Adds the ArgoCD service account as an org member (needed for SCM scanning)
-#   3. Creates a Gitea repository from the example-gitops-customer/ template
-#   4. Pushes the example application code to Gitea
-#   5. Commits _rendered/customers/<name>/<name>.yaml descriptor to the cluster-services
+#   3. Creates an empty Gitea repository
+#   4. Commits _rendered/customers/<name>/<name>.yaml descriptor to the cluster-services
 #      repo so the customer-apps ApplicationSet discovers the customer's org
-#   6. Creates an ArgoCD AppProject scoped to <orgName>-* namespaces and
+#   5. Creates an ArgoCD AppProject scoped to <orgName>-* namespaces and
 #      <orgName>/* source repos
-#   7. Sets Gitea Actions repository variables
-#   8. Grants the gitea-runner-service-account RBAC in the default namespace
+#   6. Grants the gitea-runner-service-account RBAC in the default namespace
 #      (<orgName>-<repoName>) so it can trigger rollout restarts
+#   7. Sets Gitea Actions repository variables and org secrets
+#   8. Pushes the example application code from the template repo to Gitea
+#      (last, because the push triggers the CI workflow that needs 6 + 7)
 #
 # Options:
 #   --org-name <name>        Gitea org name (default: CUSTOMER_NAME)
@@ -434,52 +435,9 @@ main() {
     echo ""
 
     # ------------------------------------------------------------------
-    # 4. Push example code to Gitea
+    # 4. Customer descriptor + ArgoCD AppProject
     # ------------------------------------------------------------------
-    log_info "=== Step 4/7: Push example application to Gitea ==="
-
-    # Shallow-clone the template repository into a temp dir
-    local template_dir
-    template_dir=$(mktemp -d "${TMPDIR:-/tmp}/customer-template.XXXXXX")
-
-    log_info "Cloning template: $CUSTOMER_TEMPLATE_REPO (branch: $template_branch)"
-    if ! git clone --depth=1 --branch "$template_branch" "$CUSTOMER_TEMPLATE_REPO" "$template_dir" 2>&1; then
-        log_error "Failed to clone template repository"
-        rm -rf "$template_dir"
-        exit 1
-    fi
-    log_success "Template cloned"
-
-    # Substitute placeholders and push to the customer's Gitea repo
-    local push_dir
-    push_dir=$(mktemp -d "${TMPDIR:-/tmp}/customer-bootstrap.XXXXXX")
-
-    substitute_placeholders \
-        "$template_dir" \
-        "$push_dir" \
-        "$GITEA_DOMAIN_NAME" \
-        "$org_name" \
-        "$repo_name" \
-        "$namespace" \
-        "$CLUSTER_EXTERNAL_DOMAIN" \
-        "$customer_name" \
-        "$ingress_host"
-
-    push_dir_to_gitea_repo \
-        "$push_dir" \
-        "$org_name" \
-        "$repo_name" \
-        "$credentials" \
-        "$GITEA_DOMAIN_NAME" \
-        "main"
-
-    rm -rf "$template_dir" "$push_dir"
-    echo ""
-
-    # ------------------------------------------------------------------
-    # 5. Customer descriptor + ArgoCD AppProject
-    # ------------------------------------------------------------------
-    log_info "=== Step 5/7: Customer descriptor + ArgoCD AppProject ==="
+    log_info "=== Step 4/7: Customer descriptor + ArgoCD AppProject ==="
 
     # Commit _rendered/customers/<name>/<name>.yaml to the cluster-services repo.
     # The customer-apps ApplicationSet reads from _rendered/customers/ — the same
@@ -543,9 +501,9 @@ EOF
     echo ""
 
     # ------------------------------------------------------------------
-    # 6. Kubernetes namespace + RBAC + image pull secret
+    # 5. Kubernetes namespace + RBAC + image pull secret
     # ------------------------------------------------------------------
-    log_info "=== Step 6/7: Kubernetes namespace + RBAC ==="
+    log_info "=== Step 5/7: Kubernetes namespace + RBAC ==="
     apply_customer_namespace "$namespace"
     apply_runner_rbac "$namespace"
 
@@ -558,9 +516,9 @@ EOF
     echo ""
 
     # ------------------------------------------------------------------
-    # 7. CI service user + Actions variables + secrets
+    # 6. CI service user + Actions variables + secrets
     # ------------------------------------------------------------------
-    log_info "=== Step 7/7: CI service user + Actions variables + secrets ==="
+    log_info "=== Step 6/7: CI service user + Actions variables + secrets ==="
 
     # Variables (plain text, non-sensitive)
     set_gitea_repo_variable "$org_name" "$repo_name" "REGISTRY_DOMAIN" "$GITEA_DOMAIN_NAME" "$gitea_api_url" "$token"
@@ -618,6 +576,51 @@ EOF
     #   CI_REGISTRY_USER   — username (stored as secret for org-level inheritance)
     set_gitea_org_secret   "$org_name" "CI_REGISTRY_TOKEN" "$pkg_token_value" "$gitea_api_url" "$token" || exit 1
     set_gitea_org_secret   "$org_name" "CI_REGISTRY_USER"  "$ci_username"     "$gitea_api_url" "$token" || exit 1
+    echo ""
+
+    # ------------------------------------------------------------------
+    # 7. Push example code to Gitea
+    # ------------------------------------------------------------------
+    # Must run last: the push triggers the CI workflow, which needs the
+    # secrets/variables/RBAC from the previous steps at job pick-up time.
+    log_info "=== Step 7/7: Push example application to Gitea ==="
+
+    # Shallow-clone the template repository into a temp dir
+    local template_dir
+    template_dir=$(mktemp -d "${TMPDIR:-/tmp}/customer-template.XXXXXX")
+
+    log_info "Cloning template: $CUSTOMER_TEMPLATE_REPO (branch: $template_branch)"
+    if ! git clone --depth=1 --branch "$template_branch" "$CUSTOMER_TEMPLATE_REPO" "$template_dir" 2>&1; then
+        log_error "Failed to clone template repository"
+        rm -rf "$template_dir"
+        exit 1
+    fi
+    log_success "Template cloned"
+
+    # Substitute placeholders and push to the customer's Gitea repo
+    local push_dir
+    push_dir=$(mktemp -d "${TMPDIR:-/tmp}/customer-bootstrap.XXXXXX")
+
+    substitute_placeholders \
+        "$template_dir" \
+        "$push_dir" \
+        "$GITEA_DOMAIN_NAME" \
+        "$org_name" \
+        "$repo_name" \
+        "$namespace" \
+        "$CLUSTER_EXTERNAL_DOMAIN" \
+        "$customer_name" \
+        "$ingress_host"
+
+    push_dir_to_gitea_repo \
+        "$push_dir" \
+        "$org_name" \
+        "$repo_name" \
+        "$credentials" \
+        "$GITEA_DOMAIN_NAME" \
+        "main"
+
+    rm -rf "$template_dir" "$push_dir"
     echo ""
 
     # ------------------------------------------------------------------
