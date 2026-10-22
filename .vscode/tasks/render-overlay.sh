@@ -304,12 +304,14 @@ merge_yaml_files() {
         cp "$overlay_file" "$overlay_rendered"
     fi
     
-    # Count documents in the base file to decide merge strategy
-    local base_doc_count
+    # Count documents to decide merge strategy
+    local base_doc_count overlay_doc_count
     base_doc_count=$(yq e 'di + 1' "$base_rendered" 2>/dev/null | tail -1)
     base_doc_count=${base_doc_count:-1}
+    overlay_doc_count=$(yq e 'di + 1' "$overlay_rendered" 2>/dev/null | tail -1)
+    overlay_doc_count=${overlay_doc_count:-1}
 
-    if [[ "$base_doc_count" -le 1 ]]; then
+    if [[ "$base_doc_count" -le 1 && "$overlay_doc_count" -le 1 ]]; then
         # Single-document file: simple merge (original behaviour, works for Helm values etc.)
         if ! yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' \
             "$base_rendered" "$overlay_rendered" > "$output_file" 2>/dev/null; then
@@ -318,12 +320,14 @@ merge_yaml_files() {
             return 1
         fi
     else
-        # Multi-document base: split into individual documents, match each by kind+metadata.name
-        # against the overlay, merge matched pairs, pass unmatched base docs through unchanged,
-        # then concatenate everything back together.
+        # Multi-document: split into individual documents, match each by kind + name
+        # (metadata.name for Kubernetes objects, top-level name for Talos documents)
+        # against the overlay, merge matched pairs, pass unmatched base docs through
+        # unchanged, append unmatched overlay docs, then concatenate everything.
         : > "$output_file"
         local first_doc=true
         local base_doc overlay_match merged_doc kind name
+        local -a matched_overlay_keys=()
         for (( i=0; i<base_doc_count; i++ )); do
             base_doc=$(mktemp)
             overlay_match=$(mktemp)
@@ -334,10 +338,11 @@ merge_yaml_files() {
 
             # Get kind and name for matching
             kind=$(yq e '.kind // ""' "$base_doc" 2>/dev/null)
-            name=$(yq e '.metadata.name // ""' "$base_doc" 2>/dev/null)
+            name=$(yq e '.metadata.name // .name // ""' "$base_doc" 2>/dev/null)
+            matched_overlay_keys+=("$kind|$name")
 
-            # Find matching document in overlay (match by kind + metadata.name)
-            yq e "select(.kind == \"$kind\" and .metadata.name == \"$name\")" \
+            # Find matching document in overlay (match by kind + name)
+            yq e "select((.kind // \"\") == \"$kind\" and (.metadata.name // .name // \"\") == \"$name\")" \
                 "$overlay_rendered" > "$overlay_match" 2>/dev/null
 
             if [[ -s "$overlay_match" ]]; then
@@ -360,6 +365,19 @@ merge_yaml_files() {
             fi
 
             rm -f "$base_doc" "$overlay_match" "$merged_doc"
+        done
+
+        local overlay_doc key
+        for (( i=0; i<overlay_doc_count; i++ )); do
+            overlay_doc=$(mktemp)
+            yq e "select(di == $i)" "$overlay_rendered" > "$overlay_doc" 2>/dev/null
+            key="$(yq e '.kind // ""' "$overlay_doc" 2>/dev/null)|$(yq e '.metadata.name // .name // ""' "$overlay_doc" 2>/dev/null)"
+            if [[ -s "$overlay_doc" && "$(yq e '. == null' "$overlay_doc" 2>/dev/null)" != "true" ]] \
+                && ! printf '%s\n' "${matched_overlay_keys[@]}" | grep -qxF "$key"; then
+                [[ "$first_doc" == "true" ]] && first_doc=false || printf '\n---\n' >> "$output_file"
+                cat "$overlay_doc" >> "$output_file"
+            fi
+            rm -f "$overlay_doc"
         done
 
         if [[ "$first_doc" == "true" ]]; then

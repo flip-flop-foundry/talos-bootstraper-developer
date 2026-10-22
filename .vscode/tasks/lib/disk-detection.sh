@@ -241,11 +241,26 @@ _resolve_install_disk_from_config() {
     local machine_config_file="$1"
     local disks_json="$2"
     local node="${3:-unknown}"
+    local size_selector=""
+
+    # 0. UnattendedInstallConfig (Talos >= 1.14): CEL match, supporting the forms
+    #    this repo generates: disk.dev_path == "/dev/x" and disk.size >= Nu * UNIT.
+    local install_match
+    install_match=$(yq 'select(.kind == "UnattendedInstallConfig") | .provisioning.diskSelector.match // ""' "$machine_config_file" 2>/dev/null | head -n1)
+    if [[ "$install_match" =~ disk\.dev_path[[:space:]]*==[[:space:]]*\"([^\"]+)\" ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    elif [[ "$install_match" =~ disk\.size[[:space:]]*(>=|<=|>|<|==)[[:space:]]*([0-9]+)u?[[:space:]]*\*[[:space:]]*([A-Za-z]+) ]]; then
+        size_selector="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+    elif [[ -n "$install_match" ]]; then
+        log_warn "Unsupported install disk selector \"$install_match\" on $node"
+        return 1
+    fi
 
     # 1. Explicit machine.install.disk — the simplest and most reliable case.
     local install_disk
     install_disk=$(yq 'select(di == 0) | .machine.install.disk // ""' "$machine_config_file" 2>/dev/null | tr -d '"' | tr -d "'" | xargs)
-    if [[ -n "$install_disk" && "$install_disk" != "null" ]]; then
+    if [[ -z "$size_selector" && -n "$install_disk" && "$install_disk" != "null" ]]; then
         echo "$install_disk"
         return 0
     fi
@@ -253,8 +268,9 @@ _resolve_install_disk_from_config() {
     # 2. machine.install.diskSelector.size  (e.g. ">= 64GB")
     # Talos evaluates diskSelector using CEL; here we handle the common size-only
     # constraint and mirror Talos's tie-breaking rule (alphabetically first match).
-    local size_selector
-    size_selector=$(yq 'select(di == 0) | .machine.install.diskSelector.size // ""' "$machine_config_file" 2>/dev/null | tr -d '"' | tr -d "'" | xargs)
+    if [[ -z "$size_selector" ]]; then
+        size_selector=$(yq 'select(di == 0) | .machine.install.diskSelector.size // ""' "$machine_config_file" 2>/dev/null | tr -d '"' | tr -d "'" | xargs)
+    fi
     if [[ -z "$size_selector" || "$size_selector" == "null" ]]; then
         return 1
     fi

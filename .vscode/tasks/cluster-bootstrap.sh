@@ -338,6 +338,11 @@ log_info "Rendering overlay manifests..."
 log_info "Ensuring Coder ↔ Gitea integration secrets are provisioned..."
 "$SCRIPT_DIR/gitea-bootstrap.sh" "$env_name" --coder-integration-only
 
+# Keeps the node registry-pull token and its per-org read access in sync with
+# customers/*/*.yaml; the Talos side picks the token up in Apply Talos configs.
+log_info "Ensuring the registry-pull account has access to all customer orgs..."
+"$SCRIPT_DIR/gitea-bootstrap.sh" "$env_name" --registry-pull-only
+
 
 log_info "Checking if ArgoCD Helm release needs upgrading..."
 helm diff upgrade argocd argo/argo-cd \

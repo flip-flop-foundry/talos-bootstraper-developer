@@ -85,7 +85,9 @@ git -C "$tmp_repo" config user.name  "render-and-push (${env_name})"
 # --delete removes files in the clone that no longer exist in the local render,
 # so Gitea's _rendered/ tracks the current render exactly.
 log_info "Syncing $rendered_dir/ -> $tmp_repo/_rendered/"
-rsync -a --delete "$rendered_dir/" "$tmp_repo/_rendered/"
+# talos/ holds machine configs and cluster secrets and is not consumed by ArgoCD;
+# --delete-excluded also purges copies pushed by older versions of this script.
+rsync -a --delete --delete-excluded --exclude '/talos/' "$rendered_dir/" "$tmp_repo/_rendered/"
 
 # Only stage files under _rendered/. Nothing else can ever get committed.
 git -C "$tmp_repo" add -A -- _rendered/

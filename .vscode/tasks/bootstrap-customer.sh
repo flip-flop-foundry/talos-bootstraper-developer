@@ -7,34 +7,35 @@ set -euo pipefail
 # Usage:
 #   bootstrap-customer.sh <env-name> <CUSTOMER_NAME> [OPTIONS]
 #
-# Bootstraps a new customer on the cluster:
+# Bootstraps a new customer (org-level setup) on the cluster:
 #   1. Creates a Gitea organisation for the customer
 #   2. Adds the ArgoCD service account as an org member (needed for SCM scanning)
-#   3. Creates an empty Gitea repository
-#   4. Commits _rendered/customers/<name>/<name>.yaml descriptor to the cluster-services
-#      repo so the customer-apps ApplicationSet discovers the customer's org
-#   5. Creates an ArgoCD AppProject scoped to <orgName>-* namespaces and
+#      and gives the central registry-pull account packages:read in the org, so
+#      every node can pull the customer's images (no per-namespace pull secrets)
+#   3. Writes customers/<name>/<name>.yaml in the env repo and commits the rendered
+#      descriptor to cluster-services so the customer-apps ApplicationSet
+#      discovers the customer's org immediately
+#   4. Creates an ArgoCD AppProject scoped to <orgName>-* namespaces and
 #      <orgName>/* source repos
-#   6. Grants the gitea-runner-service-account RBAC in the default namespace
-#      (<orgName>-<repoName>) so it can trigger rollout restarts
-#   7. Sets Gitea Actions repository variables and org secrets
-#   8. Pushes the example application code from the template repo to Gitea
-#      (last, because the push triggers the CI workflow that needs 6 + 7)
+#   5. Creates the ci-<org> user (team ci-packages, packages:write) and stores its
+#      token as org secrets CI_REGISTRY_USER / CI_REGISTRY_TOKEN
+#   6. Runs bootstrap-customer-repo.sh --with-template for the initial repo
+#      (repo + example app push)
+#
+# Further repos for the same customer: bootstrap-customer-repo.sh
+# (VS Code task "Bootstrap Customer Repo").
 #
 # Options:
 #   --org-name <name>        Gitea org name (default: CUSTOMER_NAME)
-#   --repo-name <name>       Gitea repo / app name (default: example-repo)
-#   --ingress-host <host>    Ingress hostname (default: CUSTOMER_NAME.CLUSTER_EXTERNAL_DOMAIN)
+#   --repo-name <name>       Initial repo / app name (default: example-repo)
+#   --ingress-host <host>    Ingress hostname (default: <org>-<repo>.CLUSTER_EXTERNAL_DOMAIN)
 #   --template-branch <br>   Branch of the template repo to clone (default: master)
 #   --force-recreate         Delete and re-create the Gitea org/repo if they exist
-#
-# Namespace is always derived as <orgName>-<repoName> — matching the formula
-# used by the ApplicationSet template — so it never needs to be specified.
 #
 # Env:
 #   TALOS_BOOTSTRAPPER_DATA_DIR  (required — set by devcontainer.json)
 #
-# Requirements: kubectl curl jq git rsync
+# Requirements: kubectl curl jq git rsync openssl
 ################################################################################
 
 : "${TALOS_BOOTSTRAPPER_DATA_DIR:?TALOS_BOOTSTRAPPER_DATA_DIR must be set (see .devcontainer/devcontainer.json)}"
@@ -45,11 +46,6 @@ LIB_DIR="$SCRIPT_DIR/lib"
 
 source "$LIB_DIR/logging.sh"
 source "$LIB_DIR/gitea-api.sh"
-source "$LIB_DIR/kubernetes.sh"
-
-# Remote template repository cloned during bootstrap
-readonly CUSTOMER_TEMPLATE_REPO="https://github.com/flip-flop-foundry/talos-bootstraper-customer-template"
-readonly CUSTOMER_TEMPLATE_BRANCH_DEFAULT="master"
 
 # Gitea admin secret (same as used by gitea-bootstrap.sh)
 readonly GITEA_ADMIN_SECRET="gitea-bootstrap-admin-secret"
@@ -61,12 +57,7 @@ readonly ADMIN_TOKEN_SCOPES='["write:repository","write:organization","write:adm
 readonly ARGOCD_SVC_USER="argocd-cluster-services"
 readonly ARGOCD_SVC_SECRET="gitea-argocd-cluster-services-credentials"
 
-# Registry-pull service account — needs read access to every customer org so
-# Talos containerd can pull customer images cluster-wide (via RegistryAuthConfig).
-readonly REGISTRY_PULL_USER="registry-pull"
-
-# Gitea runner SA
-readonly RUNNER_SA_NAME="gitea-runner-service-account"
+readonly CI_TEAM_NAME="ci-packages"
 
 # Global for cleanup trap
 GITEA_TOKEN_ID=""
@@ -95,13 +86,13 @@ Arguments:
 
 Options:
   --org-name <name>         Gitea org name        (default: CUSTOMER_NAME)
-  --repo-name <name>        Initial repo / app    (default: app)
-  --ingress-host <host>     Ingress hostname      (default: CUSTOMER_NAME.CLUSTER_EXTERNAL_DOMAIN)
+  --repo-name <name>        Initial repo / app    (default: example-repo)
+  --ingress-host <host>     Ingress hostname      (default: <org>-<repo>.CLUSTER_EXTERNAL_DOMAIN)
   --template-branch <br>    Template repo branch  (default: master)
   --force-recreate          Delete and re-create existing Gitea org/repo
 
 Note: namespace is always derived as <orgName>-<repoName>.
-Template repo: ${CUSTOMER_TEMPLATE_REPO}
+Add more repos later with bootstrap-customer-repo.sh.
 
 Examples:
   $(basename "$0") tuborgnetes acme
@@ -113,7 +104,7 @@ EOF
 
 check_dependencies() {
     local missing=()
-    for dep in kubectl curl jq git rsync; do
+    for dep in kubectl curl jq git rsync openssl; do
         command -v "$dep" &>/dev/null || missing+=("$dep")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -139,154 +130,6 @@ load_env_file() {
 }
 
 ################################################################################
-# Kubernetes helpers
-################################################################################
-
-apply_customer_namespace() {
-    local ns="$1"
-    log_info "Ensuring namespace: $ns"
-    kubectl get namespace "$ns" &>/dev/null && {
-        log_success "Namespace already exists: $ns"
-        return 0
-    }
-    kubectl create namespace "$ns"
-    log_success "Namespace created: $ns"
-}
-
-apply_runner_rbac() {
-    local namespace="$1"
-    local runner_ns="${GITEA_NAMESPACE}-runners"
-
-    log_info "Applying RBAC for runner SA in namespace: $namespace"
-
-    kubectl apply -f - <<EOF
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: deployment-restarter
-  namespace: ${namespace}
-  labels:
-    managed-by: bootstrap-customer
-rules:
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gitea-runner-deployment-restarter
-  namespace: ${namespace}
-  labels:
-    managed-by: bootstrap-customer
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: deployment-restarter
-subjects:
-  - kind: ServiceAccount
-    name: ${RUNNER_SA_NAME}
-    namespace: ${runner_ns}
-EOF
-
-    log_success "RBAC applied for $runner_ns/$RUNNER_SA_NAME in $namespace"
-}
-
-# Create a docker-registry imagePullSecret for the Gitea registry in the given
-# namespace and patch the default ServiceAccount to reference it.
-# This ensures all pods in the namespace can pull from the Gitea registry without
-# needing explicit imagePullSecrets in each Deployment spec.
-#
-# NOTE: Talos RegistryAuthConfig (applied by apply-node-registry-config.sh) does NOT
-# work alongside RegistryTLSConfig in containerd v2 — when config_path is set the
-# registry.configs.auth section is ignored (upstream containerd limitation). This
-# Kubernetes-native approach is the reliable workaround.
-apply_registry_pull_secret() {
-    local namespace="$1"
-    local secret_name="gitea-registry-pull"
-    local gitea_ns="${GITEA_NAMESPACE:-gitea}"
-
-    log_info "Setting up Gitea registry imagePullSecret in namespace: $namespace"
-
-    # Read registry-pull credentials from the K8s secret created by gitea-bootstrap.sh
-    local reg_user reg_pass
-    reg_user=$(kubectl get secret gitea-registry-pull-credentials -n "$gitea_ns" \
-        -o jsonpath='{.data.username}' 2>/dev/null | base64 -d)
-    reg_pass=$(kubectl get secret gitea-registry-pull-credentials -n "$gitea_ns" \
-        -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
-
-    if [[ -z "$reg_user" || -z "$reg_pass" ]]; then
-        log_warn "Could not read gitea-registry-pull-credentials from $gitea_ns namespace — skipping imagePullSecret setup"
-        log_warn "Run gitea-bootstrap.sh first to create the registry-pull service account"
-        return 0
-    fi
-
-    # Create or update the docker-registry secret in the customer namespace
-    if kubectl get secret "$secret_name" -n "$namespace" &>/dev/null; then
-        log_success "imagePullSecret '$secret_name' already exists in $namespace"
-    else
-        kubectl create secret docker-registry "$secret_name" \
-            --namespace "$namespace" \
-            --docker-server="$GITEA_DOMAIN_NAME" \
-            --docker-username="$reg_user" \
-            --docker-password="$reg_pass"
-        log_success "imagePullSecret '$secret_name' created in $namespace"
-    fi
-
-    # Patch the default ServiceAccount to include the pull secret so all pods
-    # in this namespace automatically get it without per-Deployment changes
-    kubectl patch serviceaccount default \
-        --namespace "$namespace" \
-        --type=json \
-        -p='[{"op":"add","path":"/imagePullSecrets","value":[{"name":"'"$secret_name"'"}]}]' \
-        2>/dev/null || \
-    kubectl patch serviceaccount default \
-        --namespace "$namespace" \
-        --type=merge \
-        -p='{"imagePullSecrets":[{"name":"'"$secret_name"'"}]}' 2>/dev/null || true
-
-    log_success "default ServiceAccount in $namespace patched with imagePullSecret '$secret_name'"
-}
-
-################################################################################
-# Substitute PLACEHOLDER_* values in the example template
-################################################################################
-
-substitute_placeholders() {
-    local src_dir="$1"
-    local dest_dir="$2"
-    local gitea_domain="$3"
-    local org_name="$4"
-    local app_name="$5"
-    local namespace="$6"
-    local cluster_domain="$7"
-    local customer_name="${8:-$org_name}"  # defaults to org_name if not provided
-    local ingress_host="${9:-${app_name}.${cluster_domain}}"
-    local cluster_issuer="${TALOS_CLUSTER_NAME}-ca-issuer"
-
-    log_info "Substituting placeholders into template..."
-
-    rsync -a --exclude='.git' "$src_dir/" "$dest_dir/"
-
-    # Replace all PLACEHOLDER_* strings in all files (template repo contains only text files)
-    find "$dest_dir" -type f | while read -r file; do
-        sed -i \
-            -e "s|PLACEHOLDER_GITEA_DOMAIN|${gitea_domain}|g" \
-            -e "s|PLACEHOLDER_ORG|${org_name}|g" \
-            -e "s|PLACEHOLDER_APP|${app_name}|g" \
-            -e "s|PLACEHOLDER_NAMESPACE|${namespace}|g" \
-            -e "s|PLACEHOLDER_CLUSTER_DOMAIN|${cluster_domain}|g" \
-            -e "s|PLACEHOLDER_CUSTOMER_NAME|${customer_name}|g" \
-            -e "s|PLACEHOLDER_INGRESS_HOST|${ingress_host}|g" \
-            -e "s|PLACEHOLDER_CLUSTER_ISSUER|${cluster_issuer}|g" \
-            "$file"
-    done
-
-    log_success "Placeholders substituted"
-}
-
-################################################################################
 # Main
 ################################################################################
 
@@ -302,7 +145,7 @@ main() {
     local org_name="$customer_name"
     local repo_name="example-repo"
     local ingress_host=""
-    local template_branch="$CUSTOMER_TEMPLATE_BRANCH_DEFAULT"
+    local template_branch=""
     local force_recreate="false"
 
     while [[ $# -gt 0 ]]; do
@@ -318,6 +161,12 @@ main() {
 
     # Namespace is always <orgName>-<repoName> — matches the ApplicationSet template
     local namespace="${org_name}-${repo_name}"
+
+    # Kubernetes DNS-1123 label: org is the namespace prefix of every repo
+    if [[ ! "$org_name" =~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' ]]; then
+        log_error "Org name must be lowercase alphanumerics or '-' (got '$org_name')"
+        exit 1
+    fi
 
     # Confirm destructive operation before doing anything else
     if [[ "$force_recreate" == "true" ]]; then
@@ -341,26 +190,14 @@ main() {
     local overlay_dir
     overlay_dir="$(cd "$(dirname "$env_file")" && pwd)"
 
-    [[ -z "$ingress_host" ]] && ingress_host="${namespace}.${CLUSTER_EXTERNAL_DOMAIN}"
-
-    # SCRIPT_DIR was set at the top of the file to $TALOS_BOOTSTRAPER_DIR/adminTasks
-    # so that lib functions can source their peers via "$SCRIPT_DIR/lib/...".
-    export OVERLAY_DIR="$overlay_dir"
-
-    local talosconfig="$OVERLAY_DIR/talos/talosconfig"
-    [[ -f "$talosconfig" ]] && export TALOSCONFIG="$talosconfig"
-
     local gitea_api_url="https://${GITEA_DOMAIN_NAME}/api/v1"
 
     log_info "============================================================"
     log_info "Customer bootstrap"
     log_info "  Customer name     : $customer_name"
     log_info "  Gitea org         : $org_name"
-    log_info "  Gitea repo        : $repo_name"
+    log_info "  Initial repo      : $repo_name"
     log_info "  Namespace         : $namespace  (derived: <orgName>-<repoName>)"
-    log_info "  Ingress host      : $ingress_host"
-    log_info "  Template repo     : $CUSTOMER_TEMPLATE_REPO"
-    log_info "  Template branch   : $template_branch"
     log_info "  Gitea API         : $gitea_api_url"
     log_info "============================================================"
     echo ""
@@ -368,7 +205,7 @@ main() {
     # ------------------------------------------------------------------
     # 1. Gitea admin credentials + temporary token
     # ------------------------------------------------------------------
-    log_info "=== Step 1/7: Gitea credentials ==="
+    log_info "=== Step 1/5: Gitea credentials ==="
     local credentials
     credentials=$(fetch_gitea_admin_credentials) || exit 1
     GITEA_CREDENTIALS="$credentials"
@@ -384,7 +221,7 @@ main() {
     # ------------------------------------------------------------------
     # 2. Gitea org
     # ------------------------------------------------------------------
-    log_info "=== Step 2/7: Gitea organisation ==="
+    log_info "=== Step 2/5: Gitea organisation ==="
     local org_status
     org_status=$(check_gitea_organization "$org_name" "$gitea_api_url" "$token")
 
@@ -408,36 +245,14 @@ main() {
     # Add ArgoCD service account as an org member so it can access customer repos
     add_user_to_org "$org_name" "$ARGOCD_SVC_USER" "$gitea_api_url" "$token" || true
 
-    # Add registry-pull service account so Talos containerd (RegistryAuthConfig)
-    # can pull images from this org's container registry cluster-wide.
-    add_user_to_org "$org_name" "$REGISTRY_PULL_USER" "$gitea_api_url" "$token" || true
+    # Nodes pull this org's images with the central registry-pull token (packages:read only)
+    ensure_registry_pull_account "$gitea_api_url" "$token" "$org_name" || exit 1
     echo ""
 
     # ------------------------------------------------------------------
-    # 3. Gitea repo
+    # 3. Customer descriptor + ArgoCD AppProject
     # ------------------------------------------------------------------
-    log_info "=== Step 3/7: Gitea repository ==="
-    local repo_status
-    repo_status=$(check_gitea_repository "$org_name" "$repo_name" "$gitea_api_url" "$token")
-
-    if [[ "$repo_status" == "200" ]]; then
-        if [[ "$force_recreate" == "true" ]]; then
-            delete_gitea_repository "$org_name" "$repo_name" "$gitea_api_url" "$token"
-            create_gitea_repository "$org_name" "$repo_name" "$gitea_api_url" "$token" || exit 1
-        else
-            log_success "Repo already exists: $org_name/$repo_name"
-        fi
-    elif [[ "$repo_status" == "404" ]]; then
-        create_gitea_repository "$org_name" "$repo_name" "$gitea_api_url" "$token" || exit 1
-    else
-        log_error "Unexpected status checking repo: $repo_status"; exit 1
-    fi
-    echo ""
-
-    # ------------------------------------------------------------------
-    # 4. Customer descriptor + ArgoCD AppProject
-    # ------------------------------------------------------------------
-    log_info "=== Step 4/7: Customer descriptor + ArgoCD AppProject ==="
+    log_info "=== Step 3/5: Customer descriptor + ArgoCD AppProject ==="
 
     # Commit _rendered/customers/<name>/<name>.yaml to the cluster-services repo.
     # The customer-apps ApplicationSet reads from _rendered/customers/ — the same
@@ -453,13 +268,16 @@ gitea:
 YAML
 )
 
-    # Write the descriptor to the local overlay under _rendered/customers/ so it
-    # is included in the next push-to-gitea push and matches the ArgoCD-watched path.
-    local local_descriptor_dir="${overlay_dir}/_rendered/customers/${customer_name}"
-    local local_descriptor_file="${local_descriptor_dir}/${customer_name}.yaml"
-    mkdir -p "$local_descriptor_dir"
-    printf '%s' "$descriptor_content" > "$local_descriptor_file"
-    log_success "Customer descriptor written locally: $local_descriptor_file"
+    # Source copy (customers/) survives re-renders; the _rendered/ copy keeps the
+    # next push-to-gitea identical to the API commit below.
+    local source_descriptor_file="${overlay_dir}/customers/${customer_name}/${customer_name}.yaml"
+    local rendered_descriptor_file="${overlay_dir}/${descriptor_path}"
+    local f
+    for f in "$source_descriptor_file" "$rendered_descriptor_file"; do
+        mkdir -p "$(dirname "$f")"
+        printf '%s\n' "$descriptor_content" > "$f"
+    done
+    log_success "Customer descriptor written: $source_descriptor_file"
 
     # Also commit it directly to the Gitea cluster-services repo via the API
     # so ArgoCD picks it up immediately without waiting for the next push.
@@ -501,36 +319,12 @@ EOF
     echo ""
 
     # ------------------------------------------------------------------
-    # 5. Kubernetes namespace + RBAC + image pull secret
+    # 4. CI service user + org secrets
     # ------------------------------------------------------------------
-    log_info "=== Step 5/7: Kubernetes namespace + RBAC ==="
-    apply_customer_namespace "$namespace"
-    apply_runner_rbac "$namespace"
+    log_info "=== Step 4/5: CI service user + org secrets ==="
 
-    # Create an imagePullSecret for the Gitea registry in the customer namespace
-    # and patch the default ServiceAccount to reference it.
-    # NOTE: Talos RegistryAuthConfig is set cluster-wide (apply-node-registry-config.sh)
-    # but containerd v2 ignores registry.configs.auth when config_path is also set
-    # (see containerd docs). This Kubernetes-native approach is the reliable fallback.
-    apply_registry_pull_secret "$namespace"
-    echo ""
-
-    # ------------------------------------------------------------------
-    # 6. CI service user + Actions variables + secrets
-    # ------------------------------------------------------------------
-    log_info "=== Step 6/7: CI service user + Actions variables + secrets ==="
-
-    # Variables (plain text, non-sensitive)
-    set_gitea_repo_variable "$org_name" "$repo_name" "REGISTRY_DOMAIN" "$GITEA_DOMAIN_NAME" "$gitea_api_url" "$token"
-    set_gitea_repo_variable "$org_name" "$repo_name" "CUSTOMER_ORG"    "$org_name"          "$gitea_api_url" "$token"
-    set_gitea_repo_variable "$org_name" "$repo_name" "APP_NAME"        "$repo_name"         "$gitea_api_url" "$token"
-    set_gitea_repo_variable "$org_name" "$repo_name" "NAMESPACE"       "$namespace"         "$gitea_api_url" "$token"
-
-    # Create a dedicated CI service user for this customer org.
-    # The user gets write access via the org's Owners team and holds a
-    # write:package token used for container registry pushes in CI.
-    # Using a per-customer user (instead of the cluster admin) limits blast
-    # radius: a leaked token only has access to one org's packages.
+    # Per-org CI user with packages:write only (no code access). A leaked token
+    # can only push images to this org's registry.
     local ci_username="ci-${org_name}"
     local ci_email="ci-${org_name}@cluster.local"
     local ci_password
@@ -540,33 +334,16 @@ EOF
         "$ci_username" "$ci_email" "$ci_password" \
         "$gitea_api_url" "$token" || exit 1
 
-    # Give the CI user write access by adding them to the org's Owners team
-    add_user_to_org "$org_name" "$ci_username" "$gitea_api_url" "$token" || exit 1
+    local ci_team_id
+    ci_team_id=$(ensure_gitea_org_team "$org_name" "$CI_TEAM_NAME" "write" '{"repo.packages":"write"}' \
+        "$gitea_api_url" "$token") || exit 1
+    add_user_to_team "$ci_team_id" "$ci_username" "$gitea_api_url" "$token" || exit 1
+    # Earlier versions of this script made the CI user an org owner
+    remove_user_from_org_owners "$org_name" "$ci_username" "$gitea_api_url" "$token"
 
-    # Create a write:package token as the CI user (authenticating as that user)
-    # Delete any pre-existing token with the same name first (idempotent re-run)
-    local pkg_token_name="ci-package-${org_name}"
-    curl -k -s -o /dev/null -X DELETE \
-        -u "${ci_username}:${ci_password}" \
-        "$gitea_api_url/users/$ci_username/tokens/$pkg_token_name" || true
-
-    local pkg_token_resp
-    pkg_token_resp=$(curl -k -s -S -w "\n%{http_code}" -X POST \
-        -H "Content-Type: application/json" \
-        -u "${ci_username}:${ci_password}" \
-        -d "{\"name\":\"$pkg_token_name\",\"scopes\":[\"write:package\"]}" \
-        "$gitea_api_url/users/$ci_username/tokens")
-
-    local pkg_token_code pkg_token_body pkg_token_value
-    pkg_token_code=$(get_http_code "$pkg_token_resp")
-    pkg_token_body=$(get_http_body "$pkg_token_resp")
-
-    if [[ "$pkg_token_code" != "201" ]]; then
-        log_error "Failed to create package token for $ci_username (HTTP $pkg_token_code): $pkg_token_body"
-        exit 1
-    fi
-    pkg_token_value=$(echo "$pkg_token_body" | jq -r '.sha1')
-    log_success "Package token created for CI user '$ci_username'"
+    local pkg_token_value
+    pkg_token_value=$(recreate_gitea_user_token "$ci_username" "$ci_password" "ci-package-${org_name}" \
+        '["write:package"]' "$gitea_api_url") || exit 1
 
     # Store credentials as org-level secrets so every repo in this org inherits
     # them automatically — no per-repo wiring needed for future repos.
@@ -579,48 +356,14 @@ EOF
     echo ""
 
     # ------------------------------------------------------------------
-    # 7. Push example code to Gitea
+    # 5. Initial repository (repo, namespace, pull credentials, example app)
     # ------------------------------------------------------------------
-    # Must run last: the push triggers the CI workflow, which needs the
-    # secrets/variables/RBAC from the previous steps at job pick-up time.
-    log_info "=== Step 7/7: Push example application to Gitea ==="
-
-    # Shallow-clone the template repository into a temp dir
-    local template_dir
-    template_dir=$(mktemp -d "${TMPDIR:-/tmp}/customer-template.XXXXXX")
-
-    log_info "Cloning template: $CUSTOMER_TEMPLATE_REPO (branch: $template_branch)"
-    if ! git clone --depth=1 --branch "$template_branch" "$CUSTOMER_TEMPLATE_REPO" "$template_dir" 2>&1; then
-        log_error "Failed to clone template repository"
-        rm -rf "$template_dir"
-        exit 1
-    fi
-    log_success "Template cloned"
-
-    # Substitute placeholders and push to the customer's Gitea repo
-    local push_dir
-    push_dir=$(mktemp -d "${TMPDIR:-/tmp}/customer-bootstrap.XXXXXX")
-
-    substitute_placeholders \
-        "$template_dir" \
-        "$push_dir" \
-        "$GITEA_DOMAIN_NAME" \
-        "$org_name" \
-        "$repo_name" \
-        "$namespace" \
-        "$CLUSTER_EXTERNAL_DOMAIN" \
-        "$customer_name" \
-        "$ingress_host"
-
-    push_dir_to_gitea_repo \
-        "$push_dir" \
-        "$org_name" \
-        "$repo_name" \
-        "$credentials" \
-        "$GITEA_DOMAIN_NAME" \
-        "main"
-
-    rm -rf "$template_dir" "$push_dir"
+    # Runs last: the template push triggers CI, which needs the org secrets above.
+    log_info "=== Step 5/5: Initial repository ==="
+    local repo_args=(--with-template --customer-name "$customer_name")
+    [[ -n "$template_branch" ]] && repo_args+=(--template-branch "$template_branch")
+    [[ -n "$ingress_host"    ]] && repo_args+=(--ingress-host "$ingress_host")
+    "$SCRIPT_DIR/bootstrap-customer-repo.sh" "$env_name" "$org_name" "$repo_name" "${repo_args[@]}"
     echo ""
 
     # ------------------------------------------------------------------
@@ -632,21 +375,21 @@ EOF
     log_success "  Customer     : ${customer_name}"
     log_success "  Gitea org    : ${org_name}"
     log_success "  Gitea repo   : https://${GITEA_DOMAIN_NAME}/${org_name}/${repo_name}"
-    log_success "  Namespace    : ${namespace}  (ArgoCD will create it on first sync)"
-    log_success "  Ingress      : https://${ingress_host}"
+    log_success "  Namespace    : ${namespace}"
     log_success "  AppProject   : customer-${customer_name}  (scoped to ${org_name}-* namespaces)"
-    log_success "  Descriptor   : _rendered/customers/${customer_name}/${customer_name}.yaml  (in cluster-services)"
+    log_success "  Descriptor   : customers/${customer_name}/${customer_name}.yaml  (already live in cluster-services)"
     log_success ""
     log_success "Next steps:"
-    log_success "  1. The 'customer-apps' ApplicationSet will scan org '${org_name}' within"
+    log_success "  1. Commit and push customers/${customer_name}/ in the '${env_name}' env repo."
+    log_success "     No Apply Overlay needed — the descriptor was committed to cluster-services directly."
+    log_success "  2. The 'customer-apps' ApplicationSet will scan org '${org_name}' within"
     log_success "     ~3 minutes and create an Application for each repo with a deploy/ dir."
-    log_success "     Add more repos to the org and they are picked up automatically."
-    log_success "  2. Push a commit to the Gitea repo to trigger the CI workflow"
-    log_success "     (build image → push → rollout restart)."
+    log_success "  3. For additional repos, run the 'Bootstrap Customer Repo' task"
+    log_success "     (bootstrap-customer-repo.sh ${env_name} ${org_name} <repo>)."
     log_success ""
-    log_success "  If the ApplicationSet is not yet deployed, render + apply the overlay:"
-    log_success "    ./talos-bootstraper/adminTasks/render-overlay.sh <ENV_FILE>"
-    log_success "    kubectl apply -f overlays/<cluster>/_rendered/customerApps/"
+    log_success "  Offboarding: remove customers/${customer_name}/ and run 'Render and Push to Gitea'"
+    log_success "  BEFORE deleting the Gitea org — a descriptor pointing at a missing org"
+    log_success "  stops the ApplicationSet for every customer."
     log_success "============================================================"
 }
 

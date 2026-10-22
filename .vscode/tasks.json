@@ -147,22 +147,6 @@
       "problemMatcher": []
     },
     {
-      "label": "Apply Node Registry Config",
-      "type": "shell",
-      "command": "${workspaceFolder:devenv}/.vscode/tasks/apply-node-registry-config.sh",
-      "args": [
-        "${input:activeEnvName}"
-      ],
-      "group": "build",
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "clear": true,
-        "focus": true
-      },
-      "problemMatcher": []
-    },
-    {
       "label": "Setup PXE Server",
       "type": "shell",
       "command": "${workspaceFolder:devenv}/.vscode/tasks/pxe-setup.sh",
@@ -185,6 +169,26 @@
       "args": [
         "${input:activeEnvName}",
         "${input:customerName}"
+      ],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Bootstrap Customer Repo",
+      "detail": "Add a repo to an existing customer org (optionally seeded with the example app).",
+      "type": "shell",
+      "command": "${workspaceFolder:devenv}/.vscode/tasks/bootstrap-customer-repo.sh",
+      "args": [
+        "${input:activeEnvName}",
+        "${input:customerOrgName}",
+        "${input:customerRepoName}",
+        "${input:customerRepoTemplate}"
       ],
       "group": "build",
       "presentation": {
@@ -234,6 +238,26 @@
       "id": "customerName",
       "type": "promptString",
       "description": "Customer name (lowercase, used as Gitea org name and namespace prefix)"
+    },
+    {
+      "id": "customerOrgName",
+      "type": "promptString",
+      "description": "Existing customer Gitea org name"
+    },
+    {
+      "id": "customerRepoName",
+      "type": "promptString",
+      "description": "New repo name (lowercase; namespace becomes <org>-<repo>)"
+    },
+    {
+      "id": "customerRepoTemplate",
+      "type": "pickString",
+      "description": "Seed the new repo with the example application?",
+      "options": [
+        { "label": "No — empty repo", "value": "" },
+        { "label": "Yes — push example app from template", "value": "--with-template" }
+      ],
+      "default": ""
     }
   ]
 }

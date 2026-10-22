@@ -7,13 +7,25 @@
 # health checking, and kubeconfig management.
 #
 # Dependencies: talosctl, yq, logging.sh, disk-detection.sh
-# Globals read: TALOSCONFIG, TALOS_DISK_ENCRYPTION_KMS_URL
+# Globals read: TALOSCONFIG, TALOS_DISK_ENCRYPTION_KMS_URL, GITEA_DOMAIN_NAME, GITEA_NAMESPACE
 # ============================================================================
+
+# Merge a (multi-document) patch into a machine config file in place, using Talos'
+# strategic merge: documents are matched by kind + name, unmatched ones appended.
+# Usage: patch_machine_config <config_file> <patch_file>
+patch_machine_config() {
+  local config_file="$1"
+  local patch_file="$2"
+  local tmp
+  tmp=$(mktemp)
+  talosctl machineconfig patch "$config_file" --patch "@$patch_file" --output "$tmp" \
+    && mv "$tmp" "$config_file" || { rm -f "$tmp"; return 1; }
+}
 
 # Generate per-node Talos machine config from a base template.
 # Copies base config, applies per-node overlay patch (if exists), detects disks,
-# sets HostnameConfig + certSANs, appends manifests.
-# Usage: generate_node_config <node_fqdn> <base_yaml> <output_file> <overlay_dir> [append_manifests...]
+# sets HostnameConfig + certSANs, merges extra manifests.
+# Usage: generate_node_config <node_fqdn> <base_yaml> <output_file> <overlay_dir> [patch_manifests...]
 generate_node_config() {
   local node="$1"
   local base_yaml="$2"
@@ -25,40 +37,12 @@ generate_node_config() {
   log_info "  Creating config for node $node -> $config_file"
   cp "$base_yaml" "$config_file"
 
-  # Apply per-node patch if it exists (merges into first YAML document only)
   local node_hostname
   node_hostname=$(echo "$node" | cut -d'.' -f1)
   local node_patch="$overlay_dir/talos/nodes/${node_hostname}.yaml"
   if [[ -f "$node_patch" ]]; then
     log_info "  Applying per-node patch: $node_patch"
-    local tmp_main tmp_rest tmp_merged tmp_patch_main tmp_patch_rest
-    tmp_main=$(mktemp)
-    tmp_rest=$(mktemp)
-    tmp_merged=$(mktemp)
-    tmp_patch_main=$(mktemp)
-    tmp_patch_rest=$(mktemp)
-
-    yq 'select(di == 0)' "$config_file" > "$tmp_main"
-    yq 'select(di > 0)' "$config_file" > "$tmp_rest"
-    yq 'select(di == 0)' "$node_patch" > "$tmp_patch_main"
-    yq 'select(di > 0)' "$node_patch" > "$tmp_patch_rest"
-
-    yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' "$tmp_main" "$tmp_patch_main" > "$tmp_merged"
-
-    cat "$tmp_merged" > "$config_file"
-
-    if [[ -s "$tmp_rest" ]]; then
-      echo "---" >> "$config_file"
-      cat "$tmp_rest" >> "$config_file"
-    fi
-
-    # Append additional documents from the per-node patch (e.g. LinkConfig).
-    if [[ -s "$tmp_patch_rest" ]]; then
-      echo "---" >> "$config_file"
-      cat "$tmp_patch_rest" >> "$config_file"
-    fi
-
-    rm -f "$tmp_main" "$tmp_rest" "$tmp_merged" "$tmp_patch_main" "$tmp_patch_rest"
+    patch_machine_config "$config_file" "$node_patch" || return 1
   fi
 
   # Disk detection — pass config_file so that maintenance-mode nodes can resolve
@@ -86,13 +70,62 @@ generate_node_config() {
     select(di == 0).machine.certSANs = ($existing + [env(NODE_FQDN)] | unique)
   ' "$config_file"
 
-  # Append additional manifests
+  # Merge additional manifests (e.g. VolumeConfig EPHEMERAL already exists in the
+  # generated config, so appending would duplicate it)
+  local manifest rendered_manifest
   for manifest in ${append_manifests[@]+"${append_manifests[@]}"}; do
-    log_info "  Appending manifest $manifest to $config_file"
-    echo "---" >> "$config_file"
-    envsubst < "$manifest" >> "$config_file"
-    echo "" >> "$config_file"
+    log_info "  Merging manifest $manifest into $config_file"
+    rendered_manifest=$(mktemp)
+    envsubst < "$manifest" > "$rendered_manifest"
+    patch_machine_config "$config_file" "$rendered_manifest" || { rm -f "$rendered_manifest"; return 1; }
+    rm -f "$rendered_manifest"
   done
+}
+
+# Write RegistryTLSConfig (+ RegistryAuthConfig when the registry-pull token exists)
+# for the in-cluster Gitea registry, reading the cluster CA and token via kubectl.
+# Returns 1 (and writes nothing) while the cluster CA is not available yet.
+# Usage: build_registry_config_patch <output_file> <kubeconfig>
+build_registry_config_patch() {
+  local out="$1"
+  local kubeconfig="$2"
+  local secret_ns="${GITEA_NAMESPACE:-gitea}"
+  local secret_name="${REGISTRY_PULL_SECRET:-gitea-registry-pull-credentials}"
+
+  local ca
+  ca=$(kubectl --kubeconfig "$kubeconfig" get configmap cluster-ca-bundle -n cert-manager \
+        -o json 2>/dev/null | jq -r '.data["ca.crt"] // ""')
+  [[ -z "$ca" ]] && return 1
+
+  {
+    printf 'apiVersion: v1alpha1\nkind: RegistryTLSConfig\nname: %s\nca: |-\n' "$GITEA_DOMAIN_NAME"
+    printf '%s\n' "$ca" | sed 's/^/  /'
+  } > "$out"
+
+  local secret_json user token
+  secret_json=$(kubectl --kubeconfig "$kubeconfig" get secret "$secret_name" -n "$secret_ns" -o json 2>/dev/null || true)
+  [[ -z "$secret_json" ]] && secret_json='{}'
+  user=$(jq -r '.data.username // "" | @base64d' <<<"$secret_json")
+  token=$(jq -r '.data.password // "" | @base64d' <<<"$secret_json")
+  if [[ -n "$user" && -n "$token" ]]; then
+    printf -- '---\napiVersion: v1alpha1\nkind: RegistryAuthConfig\nname: %s\nusername: %s\npassword: %s\n' \
+      "$GITEA_DOMAIN_NAME" "$(jq -Rn --arg v "$user" '$v')" "$(jq -Rn --arg v "$token" '$v')" >> "$out"
+  else
+    log_warn "Registry pull credentials $secret_ns/$secret_name not found — nodes get registry TLS trust only"
+  fi
+}
+
+# Merge a patch into the live config of running nodes (no reboot).
+# Usage: patch_running_nodes <patch_file> <node_fqdn...>
+patch_running_nodes() {
+  local patch_file="$1"
+  shift
+  local node rc=0
+  for node in "$@"; do
+    log_info "  Patching $node with $(basename "$patch_file")"
+    talosctl patch machineconfig --nodes "$node" --patch "@$patch_file" --mode no-reboot || rc=1
+  done
+  return $rc
 }
 
 # Reset a single Talos node. Skips if already in maintenance mode.

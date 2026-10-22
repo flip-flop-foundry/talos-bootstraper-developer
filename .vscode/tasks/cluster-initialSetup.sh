@@ -105,6 +105,18 @@ if [ -z "${TALOS_INSTALL_VERSION:-}" ] || [ -z "${TALOS_INSTALLER_TYPE:-}" ] || 
   exit 3
 fi
 
+# base/talos patches use Talos 1.14 documents; older contracts or talosctl reject them.
+version_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
+TALOSCTL_CLIENT_VERSION=$(talosctl version --client --short 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if ! version_ge "${TALOS_VERSION:-v0}" "v1.14.0"; then
+  log_error "TALOS_VERSION (config contract) must be >= v1.14.0, got '${TALOS_VERSION:-}'."
+  exit 3
+fi
+if ! version_ge "${TALOSCTL_CLIENT_VERSION:-v0}" "${TALOS_VERSION%.*}.0"; then
+  log_error "talosctl ${TALOSCTL_CLIENT_VERSION:-<missing>} is older than TALOS_VERSION ${TALOS_VERSION}; upgrade talosctl."
+  exit 3
+fi
+
 # ============================================================================
 # DERIVE INSTALL IMAGE FROM IMAGE FACTORY SCHEMATIC
 # ============================================================================
@@ -300,14 +312,61 @@ fi
 
   "$SCRIPT_DIR/render-overlay.sh" "$CONFIG_FILE"
 
-  # If TALOS_MIN_INSTALL_DISK_SIZE_GB is set, add a diskSelector with minimum size to avoid installing on small USB drives
-  if [ -n "${TALOS_MIN_INSTALL_DISK_SIZE_GB:-}" ]; then
-    log_info "TALOS_MIN_INSTALL_DISK_SIZE_GB is set: adding install diskSelector (size >= ${TALOS_MIN_INSTALL_DISK_SIZE_GB}GB)"
-    yq -i ".machine.install.diskSelector.size = \">= ${TALOS_MIN_INSTALL_DISK_SIZE_GB}GB\"" "$RENDERED_DIR/talos/talosPatchConfig.yaml"
-  fi
+  TALOS_PATCH_DIR=$(mktemp -d)
+  trap 'rm -rf "$TALOS_PATCH_DIR"' EXIT
 
   CONFIG_PATCH_ARGS=(--config-patch "@$RENDERED_DIR/talos/talosPatchConfig.yaml")
   CONFIG_PATCH_CONTROLPLANE_ARGS=(--config-patch-control-plane "@$RENDERED_DIR/talos/talosPatchConfigControlplane.yaml")
+
+  # Skip small disks (e.g. USB installer sticks) when picking the install disk
+  if [ -n "${TALOS_MIN_INSTALL_DISK_SIZE_GB:-}" ]; then
+    log_info "TALOS_MIN_INSTALL_DISK_SIZE_GB is set: install disk selector disk.size >= ${TALOS_MIN_INSTALL_DISK_SIZE_GB}GB"
+    cat > "$TALOS_PATCH_DIR/install-disk.yaml" <<EOF
+apiVersion: v1alpha1
+kind: UnattendedInstallConfig
+provisioning:
+  diskSelector:
+    match: disk.size >= ${TALOS_MIN_INSTALL_DISK_SIZE_GB}u * GB
+EOF
+    CONFIG_PATCH_ARGS+=(--config-patch "@$TALOS_PATCH_DIR/install-disk.yaml")
+  fi
+
+  if [[ "${TALOS_ALLOW_SCHEDULING_ON_CONTROLPLANES:-false}" == "true" ]]; then
+    log_info "TALOS_ALLOW_SCHEDULING_ON_CONTROLPLANES is true: removing the control-plane NoSchedule taint"
+    cat > "$TALOS_PATCH_DIR/controlplane-schedulable.yaml" <<'EOF'
+apiVersion: v1alpha1
+kind: KubeNodeConfig
+taints:
+  node-role.kubernetes.io/control-plane:
+    $patch: delete
+EOF
+    CONFIG_PATCH_CONTROLPLANE_ARGS+=(--config-patch-control-plane "@$TALOS_PATCH_DIR/controlplane-schedulable.yaml")
+  fi
+
+  for CERT_FILE in ${TALOS_ADDITIONAL_TRUSTEDROOT_FILES[@]+"${TALOS_ADDITIONAL_TRUSTEDROOT_FILES[@]}"}; do
+    if [ -f "$OVERLAY_DIR/$CERT_FILE" ]; then
+      CA_NAME="$(basename "$CERT_FILE" | sed 's/\.[^.]*$//')_ca"
+      log_info "Adding trusted root CA $CERT_FILE (TrustedRootsConfig $CA_NAME) to all nodes"
+      CA_CERT_BODY=$(sed 's/^/    /' "$OVERLAY_DIR/$CERT_FILE") CA_NAME="$CA_NAME" \
+        envsubst < "${BASE_DIR}/talos/trustedRootsConfigTemplate.yaml" > "$TALOS_PATCH_DIR/trusted-root-${CA_NAME}.yaml"
+      CONFIG_PATCH_ARGS+=(--config-patch "@$TALOS_PATCH_DIR/trusted-root-${CA_NAME}.yaml")
+    else
+      log_warn "Trusted root CA cert file $CERT_FILE not found, skipping."
+    fi
+  done
+
+  # Registry TLS trust + node pull credentials for the in-cluster Gitea registry.
+  # Only possible once the cluster runs; on first bootstrap they are patched in at the end.
+  REGISTRY_PATCH="$TALOS_PATCH_DIR/registry.yaml"
+  REGISTRY_CONFIG_IN_NODE_CONFIGS=false
+  if talosctl kubeconfig --nodes "${TALOS_CONTROL_NODES[0]}" --force "$TALOS_PATCH_DIR/kubeconfig" &>/dev/null \
+     && build_registry_config_patch "$REGISTRY_PATCH" "$TALOS_PATCH_DIR/kubeconfig"; then
+    log_info "Including Gitea registry TLS/auth documents in node configs"
+    CONFIG_PATCH_ARGS+=(--config-patch "@$REGISTRY_PATCH")
+    REGISTRY_CONFIG_IN_NODE_CONFIGS=true
+  else
+    log_info "Cluster CA not reachable yet — registry config will be patched in after bootstrap"
+  fi
 
 
 log_info "Generating Talos config..."
@@ -353,28 +412,6 @@ talosctl gen config --with-secrets "$OVERLAY_DIR/talos/talos-secrets.yaml" \
   else
     update_talosconfig_context "$TALOS_CLUSTER_NAME" "$TALOSCONFIG" "$TALOS_CLUSTER_ENDPOINT" "${TALOS_CONTROL_NODES[@]}"
   fi
-
-# ============================================================================
-# ADDITIONAL TRUSTED ROOT CAs
-# ============================================================================
-
-if [[ ${#TALOS_ADDITIONAL_TRUSTEDROOT_FILES[@]} -gt 0 ]]; then
-  log_info "Adding additional trusted root CA certs to Talos config"
-  for CERT_FILE in "${TALOS_ADDITIONAL_TRUSTEDROOT_FILES[@]}"; do
-    if [ -f "$OVERLAY_DIR/$CERT_FILE" ]; then
-      log_info "  Adding trusted root CA cert $CERT_FILE to $OVERLAY_DIR/talos/controlplane.yaml"
-      export CA_CERT_BODY=$(cat "$OVERLAY_DIR/$CERT_FILE" | sed 's/^/    /') # Indent each line with 4 spaces for YAML block literal
-      CA_NAME=$(basename "$CERT_FILE" | sed 's/\.[^.]*$//')
-      export CA_NAME+="_ca"
-      echo "---" >> "$OVERLAY_DIR/talos/controlplane.yaml"
-      envsubst < "${BASE_DIR}/talos/trustedRootsConfigTemplate.yaml" >> "$OVERLAY_DIR/talos/controlplane.yaml"
-      echo "" >> "$OVERLAY_DIR/talos/controlplane.yaml"
-      
-    else
-      log_warn "Trusted root CA cert file $CERT_FILE not found, skipping."
-    fi
-  done
-fi
 
 # ============================================================================
 # APPEND MANIFESTS TO CONTROL NODES
@@ -532,8 +569,8 @@ log_info "Starting CSR approval for control plane nodes..."
 approve_node_csrs 300 120 "${TALOS_CONTROL_NODES[@]}"
 
 
-"$SCRIPT_DIR/cluster-bootstrap.sh" "$env_name"
-DEPLOY_STATUS=$?
+DEPLOY_STATUS=0
+"$SCRIPT_DIR/cluster-bootstrap.sh" "$env_name" || DEPLOY_STATUS=$?
 
 # ============================================================================
 # WAIT FOR CILIUM AND DEPLOY WORKER NODES
@@ -597,21 +634,29 @@ else
 fi
 
 # ============================================================================
-# NODE REGISTRY CONFIG — distribute registry TLS trust and pull credentials
+# NODE REGISTRY CONFIG — first bootstrap only
 # ============================================================================
-# Waits for cert-manager-trust to distribute the cluster CA bundle, then
-# applies RegistryTLSConfig and RegistryAuthConfig to every node that is
-# missing them. This allows nodes to pull images from the internal Gitea
-# container registry without x509 errors. No reboot is required.
+# On a running cluster the registry documents are already part of the node configs
+# applied above. On first bootstrap the cluster CA (cert-manager) and the
+# registry-pull token (gitea-bootstrap.sh) only exist now, so patch the same
+# documents in; later runs of this task include them directly.
 
-log_info "Applying registry TLS trust and pull credentials to all Talos nodes..."
-"$SCRIPT_DIR/apply-node-registry-config.sh" "$env_name"
-CA_TRUST_STATUS=$?
-if [[ $CA_TRUST_STATUS -ne 0 ]]; then
-  log_error "Node registry config failed (exit $CA_TRUST_STATUS)."
-  log_error "Nodes will not be able to pull images from the internal registry until this is resolved."
-  log_error "Re-run:  $SCRIPT_DIR/apply-node-registry-config.sh $env_name"
-  DEPLOY_STATUS=$CA_TRUST_STATUS
+if [[ "$REGISTRY_CONFIG_IN_NODE_CONFIGS" != "true" ]]; then
+  log_info "Waiting for the cluster CA to patch registry TLS/auth into all nodes..."
+  REGISTRY_WAIT_TIMEOUT="${CLUSTER_CA_TRUST_TIMEOUT:-900}"
+  REGISTRY_WAIT_START=$(date +%s)
+  until build_registry_config_patch "$REGISTRY_PATCH" "$HOME/.kube/config"; do
+    if (( $(date +%s) - REGISTRY_WAIT_START >= REGISTRY_WAIT_TIMEOUT )); then
+      log_error "Cluster CA not available after ${REGISTRY_WAIT_TIMEOUT}s; re-run 'Apply Talos configs' once cert-manager is healthy."
+      DEPLOY_STATUS=7
+      break
+    fi
+    sleep 10
+  done
+  if [[ -s "$REGISTRY_PATCH" ]]; then
+    patch_running_nodes "$REGISTRY_PATCH" "${TALOS_CONTROL_NODES[@]}" ${TALOS_WORKER_NODES[@]+"${TALOS_WORKER_NODES[@]}"} \
+      || { log_error "Registry config patch failed on some nodes; re-run 'Apply Talos configs'."; DEPLOY_STATUS=7; }
+  fi
 fi
 
 # ============================================================================

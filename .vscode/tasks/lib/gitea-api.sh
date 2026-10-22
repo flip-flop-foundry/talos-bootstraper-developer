@@ -862,6 +862,143 @@ add_user_to_org() {
     fi
 }
 
+# Get the id of an org team by name; prints nothing if the team does not exist.
+# Args: org team_name api_url token
+get_gitea_org_team_id() {
+    local org="$1"
+    local team_name="$2"
+    local api_url="$3"
+    local token="$4"
+
+    local response
+    response=$(curl -k -s -S -w "\n%{http_code}" \
+        -H "Authorization: token $token" \
+        "$api_url/orgs/$org/teams?limit=50")
+
+    local http_code
+    http_code=$(get_http_code "$response")
+    if [[ "$http_code" != "200" ]]; then
+        log_error "Failed to list teams of $org (HTTP $http_code): $(get_http_body "$response")"
+        return 1
+    fi
+    get_http_body "$response" | jq -r --arg n "$team_name" '.[] | select(.name == $n) | .id'
+}
+
+# Create or update an org team with an explicit unit permission map; prints the team id.
+# Args: org team_name permission(read|write) units_map_json api_url token
+#   units_map_json e.g. '{"repo.packages":"read"}' — units not listed get no access.
+ensure_gitea_org_team() {
+    local org="$1"
+    local team_name="$2"
+    local permission="$3"
+    local units_map="$4"
+    local api_url="$5"
+    local token="$6"
+
+    local team_id
+    team_id=$(get_gitea_org_team_id "$org" "$team_name" "$api_url" "$token") || return 1
+
+    local payload
+    payload=$(jq -n --arg n "$team_name" --arg p "$permission" --argjson u "$units_map" \
+        '{name: $n, permission: $p, units_map: $u, includes_all_repositories: false, can_create_org_repo: false}')
+
+    local method url
+    if [[ -n "$team_id" ]]; then
+        method="PATCH"; url="$api_url/teams/$team_id"
+    else
+        method="POST";  url="$api_url/orgs/$org/teams"
+    fi
+
+    local response
+    response=$(curl -k -s -S -w "\n%{http_code}" -X "$method" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: token $token" \
+        -d "$payload" \
+        "$url")
+
+    local http_code
+    http_code=$(get_http_code "$response")
+    if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
+        log_error "Failed to ensure team $team_name in $org (HTTP $http_code): $(get_http_body "$response")"
+        return 1
+    fi
+    log_success "Team $team_name ready in $org (units: $units_map)"
+    get_http_body "$response" | jq -r '.id'
+}
+
+# Args: team_id username api_url token
+add_user_to_team() {
+    local team_id="$1"
+    local username="$2"
+    local api_url="$3"
+    local token="$4"
+
+    local http_code
+    http_code=$(curl -k -s -S -o /dev/null -w "%{http_code}" -X PUT \
+        -H "Authorization: token $token" \
+        "$api_url/teams/$team_id/members/$username")
+
+    if [[ "$http_code" != "204" && "$http_code" != "200" ]]; then
+        log_error "Failed to add $username to team $team_id (HTTP $http_code)"
+        return 1
+    fi
+    log_success "User $username added to team $team_id"
+}
+
+# Remove a user from an org's Owners team; no-op if they are not a member.
+# Args: org username api_url token
+remove_user_from_org_owners() {
+    local org="$1"
+    local username="$2"
+    local api_url="$3"
+    local token="$4"
+
+    local owners_id
+    owners_id=$(get_gitea_org_team_id "$org" "Owners" "$api_url" "$token") || return 1
+    [[ -z "$owners_id" ]] && return 0
+
+    local http_code
+    http_code=$(curl -k -s -S -o /dev/null -w "%{http_code}" -X DELETE \
+        -H "Authorization: token $token" \
+        "$api_url/teams/$owners_id/members/$username")
+
+    case "$http_code" in
+        204) log_success "Removed $username from $org Owners team" ;;
+        404) ;;
+        *)   log_warn "Could not remove $username from $org Owners team (HTTP $http_code)" ;;
+    esac
+}
+
+# (Re)create a named access token for a user, authenticating as that user; prints the token.
+# Args: username password token_name scopes_json api_url
+recreate_gitea_user_token() {
+    local username="$1"
+    local password="$2"
+    local token_name="$3"
+    local scopes="$4"
+    local api_url="$5"
+
+    curl -k -s -o /dev/null -X DELETE \
+        -u "${username}:${password}" \
+        "$api_url/users/$username/tokens/$token_name" || true
+
+    local response
+    response=$(curl -k -s -S -w "\n%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -u "${username}:${password}" \
+        -d "$(jq -n --arg n "$token_name" --argjson s "$scopes" '{name: $n, scopes: $s}')" \
+        "$api_url/users/$username/tokens")
+
+    local http_code
+    http_code=$(get_http_code "$response")
+    if [[ "$http_code" != "201" ]]; then
+        log_error "Failed to create token '$token_name' for $username (HTTP $http_code): $(get_http_body "$response")"
+        return 1
+    fi
+    log_success "Token '$token_name' created for $username"
+    get_http_body "$response" | jq -r '.sha1'
+}
+
 # Set or update an Actions repository variable (plain-text, no encryption needed).
 # Gitea 1.22+ API (confirmed against 1.25.4 swagger):
 #   POST /repos/{owner}/{repo}/actions/variables/{variablename}  -> create  body: {"value":"…"}
@@ -941,7 +1078,8 @@ push_dir_to_gitea_repo() {
     git add -A
     git commit -m "chore: initial commit from bootstrap-customer"
 
-    git -c "http.sslVerify=false" push -u "$remote_url" "HEAD:$branch" --force
+    # No -u: git echoes the tracking URL (with embedded credentials) to stdout.
+    git -c "http.sslVerify=false" push "$remote_url" "HEAD:$branch" --force
 
     popd > /dev/null
     rm -rf "$temp_dir"
@@ -1037,12 +1175,12 @@ create_or_ensure_gitea_user() {
         "$api_url/users/$username")
 
     if [[ "$check_code" == "200" ]]; then
-        log_info "CI user '$username' already exists — resetting password"
+        log_info "Service user '$username' already exists — resetting password"
         local patch_resp
         patch_resp=$(curl -k -s -S -w "\n%{http_code}" -X PATCH \
             -H "Content-Type: application/json" \
             -H "Authorization: token $admin_token" \
-            -d "$(jq -n --arg u "$username" --arg p "$password" '{source_id:0,login_name:$u,password:$p,must_change_password:false}')" \
+            -d "$(jq -n --arg u "$username" --arg p "$password" '{source_id:0,login_name:$u,password:$p,must_change_password:false,restricted:true}')" \
             "$api_url/admin/users/$username")
         local patch_code
         patch_code=$(get_http_code "$patch_resp")
@@ -1050,9 +1188,9 @@ create_or_ensure_gitea_user() {
             log_error "Failed to reset password for '$username' (HTTP $patch_code): $(get_http_body "$patch_resp")"
             return 1
         fi
-        log_success "Password reset for CI user '$username'"
+        log_success "Password reset for service user '$username'"
     else
-        log_info "Creating CI user '$username'"
+        log_info "Creating service user '$username'"
         local create_resp
         create_resp=$(curl -k -s -S -w "\n%{http_code}" -X POST \
             -H "Content-Type: application/json" \
@@ -1066,11 +1204,69 @@ create_or_ensure_gitea_user() {
         local create_code
         create_code=$(get_http_code "$create_resp")
         if [[ "$create_code" != "201" ]]; then
-            log_error "Failed to create CI user '$username' (HTTP $create_code): $(get_http_body "$create_resp")"
+            log_error "Failed to create service user '$username' (HTTP $create_code): $(get_http_body "$create_resp")"
             return 1
         fi
-        log_success "CI user '$username' created"
+        log_success "Service user '$username' created"
     fi
+}
+
+: ${REGISTRY_PULL_USERNAME:=registry-pull}
+: ${REGISTRY_PULL_SECRET:=gitea-registry-pull-credentials}
+: ${REGISTRY_READERS_TEAM:=registry-readers}
+REGISTRY_PULL_CREDENTIAL_TYPE="read-package-token"
+
+# Ensure the central registry-pull account used by every Talos node (RegistryAuthConfig):
+# a restricted user whose only credential in use is a read:package token, and whose
+# only access is a packages:read team in each given org. The token (never the
+# password) is stored in $GITEA_NAMESPACE/$REGISTRY_PULL_SECRET. Orgs that do not
+# exist are skipped with a warning.
+# Args: api_url admin_token org...
+ensure_registry_pull_account() {
+    local api_url="$1"
+    local admin_token="$2"
+    shift 2
+    local ns="${GITEA_NAMESPACE:-gitea}"
+
+    local cred_type
+    cred_type=$(kubectl get secret "$REGISTRY_PULL_SECRET" -n "$ns" -o json 2>/dev/null \
+        | jq -r '.metadata.annotations["talos-bootstrapper/credential-type"] // ""' || true)
+
+    if [[ "$cred_type" == "$REGISTRY_PULL_CREDENTIAL_TYPE" ]]; then
+        log_success "Registry-pull token already provisioned: $ns/$REGISTRY_PULL_SECRET"
+    else
+        log_info "Provisioning read:package token for $REGISTRY_PULL_USERNAME"
+        # Password is reset to an unstored random value; only the scoped token is kept.
+        local password token
+        password=$(openssl rand -base64 32 | tr -d '+/=' | head -c 40)
+        create_or_ensure_gitea_user "$REGISTRY_PULL_USERNAME" "${REGISTRY_PULL_USERNAME}@cluster.local" \
+            "$password" "$api_url" "$admin_token" || return 1
+        token=$(recreate_gitea_user_token "$REGISTRY_PULL_USERNAME" "$password" "talos-nodes" \
+            '["read:package"]' "$api_url") || return 1
+
+        kubectl create secret generic "$REGISTRY_PULL_SECRET" -n "$ns" \
+            --from-literal=username="$REGISTRY_PULL_USERNAME" \
+            --from-literal=password="$token" \
+            --dry-run=client -o yaml \
+          | kubectl annotate --local -f - -o yaml \
+              "talos-bootstrapper/credential-type=$REGISTRY_PULL_CREDENTIAL_TYPE" \
+              "description=read:package token for Talos RegistryAuthConfig (all nodes)" \
+          | kubectl apply -f - >/dev/null || return 1
+        log_success "Registry-pull token stored in $ns/$REGISTRY_PULL_SECRET"
+    fi
+
+    local org team_id
+    for org in "$@"; do
+        if [[ "$(check_gitea_organization "$org" "$api_url" "$admin_token")" != "200" ]]; then
+            log_warn "Org '$org' not found in Gitea — skipping registry-pull access"
+            continue
+        fi
+        team_id=$(ensure_gitea_org_team "$org" "$REGISTRY_READERS_TEAM" "read" '{"repo.packages":"read"}' \
+            "$api_url" "$admin_token") || return 1
+        add_user_to_team "$team_id" "$REGISTRY_PULL_USERNAME" "$api_url" "$admin_token" || return 1
+        # Earlier versions made registry-pull an org owner
+        remove_user_from_org_owners "$org" "$REGISTRY_PULL_USERNAME" "$api_url" "$admin_token"
+    done
 }
 
 # Create or update an org-level Actions variable.

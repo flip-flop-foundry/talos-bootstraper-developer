@@ -59,13 +59,9 @@ readonly ARGOCD_SERVICE_ACCOUNT_REPO_SECRET_DESCRIPTION="Read-only token/ArgoRep
 readonly ARGOCD_SERVICE_TOKEN_SCOPES='["read:repository","read:organization","read:user","read:issue"]' #Scopes given to ArgoCD service account token
 readonly CUSTOMERS_ARGOCD_SCM_SECRET="gitea-argocd-customers-scm-token" #k8s secret used by the customer-apps ApplicationSet SCM provider
 
-# Registry pull service account — used by Talos RegistryAuthConfig so all cluster
-# nodes can pull images from the Gitea container registry without imagePullSecrets.
-# Must be added as an org member in every customer org (done by bootstrap-customer.sh).
-readonly REGISTRY_PULL_USERNAME="registry-pull"
-readonly REGISTRY_PULL_SECRET="gitea-registry-pull-credentials"  # K8s secret in GITEA_NAMESPACE
-readonly REGISTRY_PULL_SECRET_DESCRIPTION="Read-only Gitea credentials for Talos RegistryAuthConfig — allows containerd on all nodes to pull images from the Gitea container registry"
-readonly REGISTRY_PULL_PASSWORD_LENGTH=32
+# Registry pull service account (REGISTRY_PULL_* defaults in lib/gitea-api.sh) — used by
+# Talos RegistryAuthConfig so all nodes can pull from the Gitea container registry.
+# Gets packages:read in the cluster org and every customer org (customers/*/*.yaml).
 
 # Coder ↔ Gitea integration. Two persistent OAuth2 apps (runtime login + workspace
 # git external-auth). CODER_SESSION_TOKEN is published to the repo with the Gitea
@@ -100,6 +96,7 @@ Arguments:
   --force-recreate-argocd-svc-user Delete and recreate ArgoCD service account user and secrets
   --coder-integration-only         Only (re)provision the Coder <-> Gitea secrets, then exit (idempotent; used on every apply)
   --coder-token-only               Only mint + publish CODER_SESSION_TOKEN (waits for Coder, skips if already published), then exit
+  --registry-pull-only             Only ensure the registry-pull account, token and org access, then exit (idempotent; used on every apply)
 
 Requirements:
   - kubectl
@@ -210,6 +207,18 @@ cleanup_all() {
     cleanup_git_state
 }
 
+# Orgs the central registry-pull account may read packages from: the cluster org
+# plus every customer org declared in $OVERLAY_DIR/customers/*/*.yaml.
+registry_pull_orgs() {
+    local f
+    {
+        echo "$GITEA_CLUSTER_GITEA_ORG_NAME"
+        for f in "$OVERLAY_DIR"/customers/*/*.yaml(N); do
+            yq -r '.gitea.orgName // ""' "$f"
+        done
+    } | grep -v '^$' | sort -u
+}
+
 # Register cleanup trap
 trap cleanup_all EXIT
 
@@ -229,6 +238,7 @@ main() {
     local force_recreate_argocd_svc_user="false"
     local coder_integration_only="false"
     local coder_token_only="false"
+    local registry_pull_only="false"
     # Parse optional flags
     shift  # Remove first argument (env_file)
     while [[ $# -gt 0 ]]; do
@@ -257,6 +267,10 @@ main() {
                 # applied, so greenfield publishes in the same run. Waits for Coder
                 # to become Available and skips when the repo secret already exists.
                 coder_token_only="true"
+                shift
+                ;;
+            --registry-pull-only)
+                registry_pull_only="true"
                 shift
                 ;;
             *)
@@ -362,6 +376,14 @@ main() {
         fi
         echo ""
         log_success "CODER_SESSION_TOKEN publish complete (coder-token-only mode)"
+        return 0
+    fi
+
+    local -a pull_orgs=("${(@f)$(registry_pull_orgs)}")
+
+    if [[ "$registry_pull_only" == "true" ]]; then
+        ensure_registry_pull_account "$gitea_api_url" "$token" "${pull_orgs[@]}" || exit 1
+        log_success "Registry-pull account ready (registry-pull-only mode)"
         return 0
     fi
 
@@ -577,22 +599,10 @@ main() {
     ################################################################################
 
     log_info "Setting up Gitea registry-pull service account..."
-    local registry_pull_email="${REGISTRY_PULL_USERNAME}@${GITEA_DOMAIN_NAME}"
-    local registry_pull_password
-    registry_pull_password=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c "$REGISTRY_PULL_PASSWORD_LENGTH")
-
-    if ! create_gitea_user "$REGISTRY_PULL_USERNAME" "$registry_pull_email" "$gitea_api_url" "$token" "$registry_pull_password"; then
-        log_error "Failed to create registry-pull user"
+    if ! ensure_registry_pull_account "$gitea_api_url" "$token" "${pull_orgs[@]}"; then
+        log_error "Failed to set up registry-pull service account"
         exit 1
     fi
-
-    # Store credentials in the gitea namespace so apply-node-registry-config.sh can
-    # read them when applying RegistryAuthConfig to all Talos nodes.
-    if ! ensure_credentials_secret "$REGISTRY_PULL_USERNAME" "$registry_pull_password" "$REGISTRY_PULL_SECRET" "$GITEA_NAMESPACE" "$REGISTRY_PULL_SECRET_DESCRIPTION"; then
-        log_error "Failed to ensure registry-pull credentials secret"
-        exit 1
-    fi
-    log_success "Registry-pull service account ready: $GITEA_NAMESPACE/$REGISTRY_PULL_SECRET"
     echo ""
 
     ############################################################################
