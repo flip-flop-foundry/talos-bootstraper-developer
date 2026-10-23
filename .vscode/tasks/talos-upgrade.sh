@@ -374,15 +374,29 @@ verify_target_image() {
   esac
 }
 
+# talosctl health only accepts IP addresses for --control-plane-nodes/--worker-nodes.
+# Ask each node for its kubelet node IP: local DNS can resolve the FQDNs to proxy addresses.
+resolve_node_ips_csv() {
+  local node ip
+  local -a ips=()
+  for node in "$@"; do
+    ip=$(talosctl_filtered get nodeips --talosconfig "$TALOSCONFIG" --nodes "$node" -o json 2>/dev/null |
+      jq -r '.spec.addresses[0] // empty' | head -n1) || ip=''
+    [[ -n "$ip" ]] || { log "health: unable to read the node IP of $node" >&2; return 1; }
+    ips+=("$ip")
+  done
+  (IFS=','; printf '%s' "${ips[*]}")
+}
+
 run_talos_health() {
   local cp_csv worker_csv
-  cp_csv=$(IFS=','; printf '%s' "${TALOS_CONTROL_NODES[*]}")
+  cp_csv=$(resolve_node_ips_csv "${TALOS_CONTROL_NODES[@]}") || return 1
   if [[ ${#TALOS_WORKER_NODES[@]} -eq 0 ]]; then
     talosctl_filtered health --talosconfig "$TALOSCONFIG" \
       --control-plane-nodes "$cp_csv" --wait-timeout "$HEALTH_WAIT_TIMEOUT"
     return
   fi
-  worker_csv=$(IFS=','; printf '%s' "${TALOS_WORKER_NODES[*]}")
+  worker_csv=$(resolve_node_ips_csv "${TALOS_WORKER_NODES[@]}") || return 1
   talosctl_filtered health --talosconfig "$TALOSCONFIG" \
     --control-plane-nodes "$cp_csv" --worker-nodes "$worker_csv" \
     --wait-timeout "$HEALTH_WAIT_TIMEOUT"
@@ -632,8 +646,11 @@ for node in "${all_nodes[@]}"; do
   node_ready["$node"]=$(jq -r '(.spec.stage == "running" and .spec.status.ready == true)' <<<"$status_json")
   [[ "${node_ready[$node]}" == true ]] || fail "$node is not reporting ready/running"
 
+  # 1.14+ contract configs carry the image in UnattendedInstallConfig, older ones in .machine.install.
   node_image["$node"]=$(talosctl_filtered get machineconfig --talosconfig "$TALOSCONFIG" --nodes "$node" -o json |
-    jq -r '.spec' | yq 'select(.machine.install.image != null) | .machine.install.image' | sed -n '1p')
+    jq -r '.spec' |
+    yq ea '[(select(.kind == "UnattendedInstallConfig") | .installer.image), (select(.machine.install.image != null) | .machine.install.image)]
+           | map(select(. != null and . != "")) | .[0] // ""')
   [[ "${node_image[$node]}" =~ ^factory\.talos\.dev/[A-Za-z0-9._-]+/[A-Fa-f0-9]{32,}:[A-Za-z0-9._-]+$ ]] ||
     fail "unable to parse the existing Image Factory installer image for $node"
 

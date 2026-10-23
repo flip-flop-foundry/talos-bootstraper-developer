@@ -109,9 +109,39 @@ fi
 
 # base/talos patches use Talos 1.14 documents; older contracts or talosctl reject them.
 version_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
+
+# Running nodes below 1.14 would reject the generated config. Unreachable and
+# maintenance-mode nodes (fresh installs) do not answer this query and are skipped,
+# as are all nodes when TALOS_RESET_NODES rebuilds them anyway.
+OUTDATED_TALOS_NODES=()
+if [[ -f "$TALOSCONFIG" && "${TALOS_RESET_NODES:-false}" != "true" ]]; then
+  for NODE in "${TALOS_CONTROL_NODES[@]}" ${TALOS_WORKER_NODES[@]+"${TALOS_WORKER_NODES[@]}"}; do
+    NODE_TALOS_VERSION=$(timeout 8 talosctl get version --talosconfig "$TALOSCONFIG" --nodes "$NODE" -o json 2>/dev/null \
+      | jq -r '.spec.version // empty' 2>/dev/null) || NODE_TALOS_VERSION=""
+    if [[ -n "$NODE_TALOS_VERSION" ]] && ! version_ge "$NODE_TALOS_VERSION" "v1.14.0"; then
+      OUTDATED_TALOS_NODES+=("$NODE ($NODE_TALOS_VERSION)")
+    fi
+  done
+fi
+if [[ ${#OUTDATED_TALOS_NODES[@]} -gt 0 ]]; then
+  log_error "These nodes run Talos older than v1.14.0 and would reject the generated machine config:"
+  for NODE in "${OUTDATED_TALOS_NODES[@]}"; do
+    log_error "  $NODE"
+  done
+  log_error "Upgrade them first with the 'Talos Upgrade Planner' task (one minor release per run),"
+  log_error "then set TALOS_VERSION and TALOS_INSTALL_VERSION to the new release and re-run this task."
+  exit 3
+fi
+
 TALOSCTL_CLIENT_VERSION=$(talosctl version --client --short 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 if ! version_ge "${TALOS_VERSION:-v0}" "v1.14.0"; then
   log_error "TALOS_VERSION (config contract) must be >= v1.14.0, got '${TALOS_VERSION:-}'."
+  log_error "If the cluster still runs Talos < 1.14, upgrade it first with the 'Talos Upgrade Planner' task."
+  exit 3
+fi
+if ! version_ge "${TALOS_INSTALL_VERSION}" "${TALOS_VERSION%.*}.0"; then
+  log_error "TALOS_INSTALL_VERSION ${TALOS_INSTALL_VERSION} is older than TALOS_VERSION ${TALOS_VERSION}: a fresh install or reset would boot a Talos that rejects this config."
+  log_error "Set it to the release the 'Talos Upgrade Planner' task upgraded the cluster to."
   exit 3
 fi
 if ! version_ge "${TALOSCTL_CLIENT_VERSION:-v0}" "${TALOS_VERSION%.*}.0"; then
