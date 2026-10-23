@@ -35,6 +35,7 @@ find_legacy_talos_patch_fields() {
     "machine.kubelet.skipNodeRegistration|KubeNodeConfig .skipNodeRegistration"
     "machine.features.hostDNS|ResolverConfig .hostDNS"
     "machine.features.kubePrism|KubePrismConfig"
+    "machine.features.kubernetesTalosAPIAccess|KubeTalosAPIAccessConfig"
     "cluster.allowSchedulingOnControlPlanes|TALOS_ALLOW_SCHEDULING_ON_CONTROLPLANES in the .env"
     "cluster.network|KubeNetworkConfig (no CNI: delete KubeFlannelCNIConfig)"
     "cluster.proxy|KubeProxyConfig"

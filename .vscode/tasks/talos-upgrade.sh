@@ -116,7 +116,12 @@ talosctl_filtered() {
 # `set -e` abort on EOF with no explanation. The locals are prefixed because
 # `printf -v` would otherwise assign to a same-named local declared here.
 ask() {
-  local _ask_prompt="$1" _ask_varname="$2" _ask_reply
+  local _ask_prompt="$1" _ask_varname="$2" _ask_reply _ask_discard
+  # Keystrokes and terminal escape sequences typed during long waits sit in the tty
+  # buffer and would otherwise be read as the answer, so discard them first.
+  if [[ -t 0 ]]; then
+    while IFS= read -r -s -t 0.1 -n 4096 _ask_discard; do :; done
+  fi
   if ! IFS= read -r -p "$_ask_prompt" _ask_reply; then
     fail 'no input available on stdin; run this task from an interactive terminal'
   fi
@@ -128,12 +133,12 @@ ask() {
 
 confirm() {
   local _confirm_reply
-  ask "$1 [y/N] " _confirm_reply
-  if [[ "$_confirm_reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
-    return 0
-  fi
-  [[ "$_confirm_reply" =~ ^([Nn][Oo]?)?$ ]] || log "Read '$_confirm_reply' as a no."
-  return 1
+  while true; do
+    ask "$1 [y/N] " _confirm_reply
+    [[ "$_confirm_reply" =~ ^[Yy]([Ee][Ss])?$ ]] && return 0
+    [[ "$_confirm_reply" =~ ^([Nn][Oo]?)?$ ]] && return 1
+    log "Unrecognized answer $(printf '%q' "$_confirm_reply"); please answer y or n."
+  done
 }
 
 # Gate for any command that mutates a node. Always prompts when interactive=true.
@@ -388,18 +393,19 @@ resolve_node_ips_csv() {
   (IFS=','; printf '%s' "${ips[*]}")
 }
 
+# talosctl health runs against exactly one node, so pin it to a control-plane node
+# instead of inheriting the talosconfig context's (possibly multi-node) default.
 run_talos_health() {
   local cp_csv worker_csv
+  local -a health_args=(--talosconfig "$TALOSCONFIG" --nodes "${TALOS_CONTROL_NODES[0]}"
+    --wait-timeout "$HEALTH_WAIT_TIMEOUT")
   cp_csv=$(resolve_node_ips_csv "${TALOS_CONTROL_NODES[@]}") || return 1
-  if [[ ${#TALOS_WORKER_NODES[@]} -eq 0 ]]; then
-    talosctl_filtered health --talosconfig "$TALOSCONFIG" \
-      --control-plane-nodes "$cp_csv" --wait-timeout "$HEALTH_WAIT_TIMEOUT"
-    return
+  health_args+=(--control-plane-nodes "$cp_csv")
+  if [[ ${#TALOS_WORKER_NODES[@]} -gt 0 ]]; then
+    worker_csv=$(resolve_node_ips_csv "${TALOS_WORKER_NODES[@]}") || return 1
+    health_args+=(--worker-nodes "$worker_csv")
   fi
-  worker_csv=$(resolve_node_ips_csv "${TALOS_WORKER_NODES[@]}") || return 1
-  talosctl_filtered health --talosconfig "$TALOSCONFIG" \
-    --control-plane-nodes "$cp_csv" --worker-nodes "$worker_csv" \
-    --wait-timeout "$HEALTH_WAIT_TIMEOUT"
+  talosctl_filtered health "${health_args[@]}"
 }
 
 # Waits for a node to report the target version and a running/ready machine status.

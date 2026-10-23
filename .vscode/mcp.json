@@ -1,8 +1,4 @@
 {
   "servers": {
-    "context-mode": {
-      "command": "context-mode",
-      "args": ["mcp"]
-    }
   }
 }
