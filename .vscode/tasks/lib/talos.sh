@@ -22,6 +22,42 @@ patch_machine_config() {
     && mv "$tmp" "$config_file" || { rm -f "$tmp"; return 1; }
 }
 
+# Prints "<file>: <legacy field> -> <replacement>" for v1alpha1 fields in env-owned patches that
+# conflict with the documents gen config emits at the Talos 1.14 contract.
+# Usage: find_legacy_talos_patch_fields <patch_file...>
+find_legacy_talos_patch_fields() {
+  local -a legacy=(
+    "machine.nodeLabels|KubeNodeConfig .labels"
+    "machine.nodeAnnotations|KubeNodeConfig .annotations"
+    "machine.nodeTaints|KubeNodeConfig .taints"
+    "machine.kubelet.nodeIP|KubeNodeConfig .nodeIP"
+    "machine.kubelet.registerWithFQDN|KubeNodeConfig .registerWithFQDN"
+    "machine.kubelet.skipNodeRegistration|KubeNodeConfig .skipNodeRegistration"
+    "machine.features.hostDNS|ResolverConfig .hostDNS"
+    "machine.features.kubePrism|KubePrismConfig"
+    "cluster.allowSchedulingOnControlPlanes|TALOS_ALLOW_SCHEDULING_ON_CONTROLPLANES in the .env"
+    "cluster.network|KubeNetworkConfig (no CNI: delete KubeFlannelCNIConfig)"
+    "cluster.proxy|KubeProxyConfig"
+    "cluster.apiServer|KubeAPIServerConfig"
+    "cluster.controllerManager|KubeControllerManagerConfig"
+    "cluster.scheduler|KubeSchedulerConfig"
+    "cluster.coreDNS|KubeCoreDNSConfig"
+    "cluster.discovery|DiscoveryServiceConfig"
+  )
+  local file entry count
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    for entry in "${legacy[@]}"; do
+      count=$(yq ea "[select(.${entry%%|*} != null)] | length" "$file" 2>/dev/null) || count=0
+      [[ "$count" =~ ^[1-9] ]] && printf '%s: .%s -> %s\n' "$file" "${entry%%|*}" "${entry#*|}"
+    done
+    # base/talos keeps the legacy .machine.kubelet (Longhorn extraMounts), which excludes KubeletConfig.
+    count=$(yq ea '[select(.kind == "KubeletConfig")] | length' "$file" 2>/dev/null) || count=0
+    [[ "$count" =~ ^[1-9] ]] && printf '%s: KubeletConfig -> .machine.kubelet\n' "$file"
+  done
+  return 0
+}
+
 # Generate per-node Talos machine config from a base template.
 # Copies base config, applies per-node overlay patch (if exists), detects disks,
 # sets HostnameConfig + certSANs, merges extra manifests.

@@ -108,6 +108,7 @@ if [ -z "${TALOS_INSTALL_VERSION:-}" ] || [ -z "${TALOS_INSTALLER_TYPE:-}" ] || 
 fi
 
 # base/talos patches use Talos 1.14 documents; older contracts or talosctl reject them.
+readonly TALOS_114_MIGRATION_DOCS="https://docs.siderolabs.com/talos/v1.14/configure-your-talos-cluster/lifecycle-management/upgrading-talos#machine-configuration-changes"
 version_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
 
 # Running nodes below 1.14 would reject the generated config. Unreachable and
@@ -344,6 +345,14 @@ fi
 
   "$SCRIPT_DIR/render-overlay.sh" "$CONFIG_FILE"
 
+  LEGACY_PATCH_FIELDS=$(find_legacy_talos_patch_fields \
+    "$OVERLAY_DIR"/talos/talosPatchConfig*.yaml "$OVERLAY_DIR"/talos/nodes/*.yaml)
+  if [[ -n "$LEGACY_PATCH_FIELDS" ]]; then
+    log_warn "These env-repo Talos patches use v1alpha1 fields that conflict with Talos 1.14 documents; migrate them manually:"
+    while IFS= read -r LINE; do log_warn "  $LINE"; done <<<"$LEGACY_PATCH_FIELDS"
+    log_warn "  Field map: $TALOS_114_MIGRATION_DOCS"
+  fi
+
   TALOS_PATCH_DIR=$(mktemp -d)
   trap 'rm -rf "$TALOS_PATCH_DIR"' EXIT
 
@@ -474,12 +483,14 @@ TALOS_APPEND_MANIFESTS_ALL_NODES+=("${BASE_DIR}/talos/securityProfileConfig.yaml
 # ============================================================================
 
 log_info "Generating per-node configs for control plane nodes..."
+GENERATED_NODE_CONFIGS=()
 for NODE in "${TALOS_CONTROL_NODES[@]}"; do
   NODE_HOSTNAME=$(echo "$NODE" | cut -d'.' -f1)
   NODE_CONFIG_FILE="$RENDERED_DIR/talos/controlplane-${NODE_HOSTNAME}.yaml"
   generate_node_config "$NODE" "$OVERLAY_DIR/talos/controlplane.yaml" "$NODE_CONFIG_FILE" "$OVERLAY_DIR" \
     ${TALOS_APPEND_MANIFESTS_ALL_NODES[@]+"${TALOS_APPEND_MANIFESTS_ALL_NODES[@]}"} \
     ${TALOS_APPEND_MANIFESTS_CONTROL_NODES[@]+"${TALOS_APPEND_MANIFESTS_CONTROL_NODES[@]}"}
+  GENERATED_NODE_CONFIGS+=("$NODE_CONFIG_FILE")
 done
 
 if [[ ${#TALOS_WORKER_NODES[@]} -gt 0 ]]; then
@@ -489,10 +500,30 @@ if [[ ${#TALOS_WORKER_NODES[@]} -gt 0 ]]; then
     NODE_CONFIG_FILE="$RENDERED_DIR/talos/worker-${NODE_HOSTNAME}.yaml"
     generate_node_config "$NODE" "$OVERLAY_DIR/talos/worker.yaml" "$NODE_CONFIG_FILE" "$OVERLAY_DIR" \
       ${TALOS_APPEND_MANIFESTS_ALL_NODES[@]+"${TALOS_APPEND_MANIFESTS_ALL_NODES[@]}"}
+    GENERATED_NODE_CONFIGS+=("$NODE_CONFIG_FILE")
   done
 fi
 
 print_volume_encryption_summary "${TALOS_CONTROL_NODES[@]}"
+
+# Validate locally so a config the nodes would reject stops the run before anything is applied.
+VALIDATION_MODE=cloud
+[[ "$TALOS_INSTALLER_TYPE" == metal* ]] && VALIDATION_MODE=metal
+INVALID_NODE_CONFIGS=0
+for NODE_CONFIG_FILE in "${GENERATED_NODE_CONFIGS[@]}"; do
+  if ! VALIDATION_OUTPUT=$(talosctl validate --config "$NODE_CONFIG_FILE" --mode "$VALIDATION_MODE" 2>&1); then
+    log_error "$NODE_CONFIG_FILE fails Talos validation:"
+    while IFS= read -r LINE; do [[ -n "$LINE" ]] && log_error "  $LINE"; done <<<"$VALIDATION_OUTPUT"
+    INVALID_NODE_CONFIGS=$((INVALID_NODE_CONFIGS + 1))
+  fi
+done
+if [[ $INVALID_NODE_CONFIGS -gt 0 ]]; then
+  log_error "$INVALID_NODE_CONFIGS node config(s) are invalid; nothing was applied."
+  [[ -n "${LEGACY_PATCH_FIELDS:-}" ]] && log_error "Migrate the v1alpha1 fields listed in the warnings above first."
+  log_error "Field map: $TALOS_114_MIGRATION_DOCS"
+  exit 3
+fi
+log_success "All ${#GENERATED_NODE_CONFIGS[@]} node configs pass talosctl validate (--mode $VALIDATION_MODE)"
 
 
 
