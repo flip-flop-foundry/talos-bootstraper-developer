@@ -435,21 +435,8 @@ export TALOS_FILESYSTEM_TRIM_INTERVAL="${TALOS_FILESYSTEM_TRIM_INTERVAL:-168h0m0
 log_info "Scheduling filesystem trim on all nodes (interval ${TALOS_FILESYSTEM_TRIM_INTERVAL})"
 TALOS_APPEND_MANIFESTS_ALL_NODES+=("${BASE_DIR}/talos/filesystemTrimConfig.yaml")
 
-# Workload isolation (sandboxd), pinned so new and upgraded clusters behave identically:
-# gen config emits workloadIsolation: true, an upgraded cluster has no document (= off).
-# The strategic merge matches the generated singleton by kind and overrides the field.
-export TALOS_WORKLOAD_ISOLATION="${TALOS_WORKLOAD_ISOLATION:-false}"
-if [[ "$TALOS_WORKLOAD_ISOLATION" != "true" && "$TALOS_WORKLOAD_ISOLATION" != "false" ]]; then
-  log_error "TALOS_WORKLOAD_ISOLATION must be \"true\" or \"false\", got '$TALOS_WORKLOAD_ISOLATION'."
-  exit 3
-fi
-if [[ "$TALOS_WORKLOAD_ISOLATION" == "true" ]]; then
-  log_warn "TALOS_WORKLOAD_ISOLATION=true: kubelet, CRI and all pods move into the sandboxd namespace"
-  log_warn "  Longhorn locates the host iscsid and kubelet via /host/proc and enters their namespaces;"
-  log_warn "  that lookup predates sandboxd. Verify volume attach on one worker before rolling this out."
-else
-  log_info "Pinning workloadIsolation=false (Longhorn compatibility; see base/talos/README.md)"
-fi
+# gen config emits workloadIsolation: true; the merge overrides it to false (Longhorn, see base/talos/README.md).
+log_info "Pinning workloadIsolation=false on all nodes (Longhorn compatibility)"
 TALOS_APPEND_MANIFESTS_ALL_NODES+=("${BASE_DIR}/talos/securityProfileConfig.yaml")
 
 # ============================================================================
