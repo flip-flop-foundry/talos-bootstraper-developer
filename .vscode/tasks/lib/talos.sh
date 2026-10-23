@@ -6,7 +6,7 @@
 # Shared helper functions for Talos node configuration, reset, apply,
 # health checking, and kubeconfig management.
 #
-# Dependencies: talosctl, yq, logging.sh, disk-detection.sh
+# Dependencies: talosctl, yq, logging.sh, disk-detection.sh, volume-encryption.sh
 # Globals read: TALOSCONFIG, TALOS_DISK_ENCRYPTION_KMS_URL, GITEA_DOMAIN_NAME, GITEA_NAMESPACE
 # ============================================================================
 
@@ -80,6 +80,9 @@ generate_node_config() {
     patch_machine_config "$config_file" "$rendered_manifest" || { rm -f "$rendered_manifest"; return 1; }
     rm -f "$rendered_manifest"
   done
+
+  # Last step, so it sees every volume document (base, node patch, disks, manifests)
+  reconcile_node_volume_encryption "$node" "$config_file" || return 1
 }
 
 # Write RegistryTLSConfig (+ RegistryAuthConfig when the registry-pull token exists)

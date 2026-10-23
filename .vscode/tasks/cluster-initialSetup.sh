@@ -80,6 +80,8 @@ source "$LIB_DIR/kubernetes.sh" || { log_error "Failed to load kubernetes.sh"; e
 source "$LIB_DIR/image-factory.sh" || { log_error "Failed to load image-factory.sh"; exit 1; }
 # shellcheck source=./lib/talos.sh
 source "$LIB_DIR/talos.sh" || { log_error "Failed to load talos.sh"; exit 1; }
+# shellcheck source=./lib/volume-encryption.sh
+source "$LIB_DIR/volume-encryption.sh" || { log_error "Failed to load volume-encryption.sh"; exit 1; }
 
 export OVERLAY_DIR="$(cd "$(dirname "$CONFIG_FILE")" && pwd)"
 export NR_OF_CONTROL_NODES=${#TALOS_CONTROL_NODES[@]}
@@ -414,15 +416,17 @@ talosctl gen config --with-secrets "$OVERLAY_DIR/talos/talos-secrets.yaml" \
   fi
 
 # ============================================================================
-# APPEND MANIFESTS TO CONTROL NODES
+# SYSTEM VOLUME ENCRYPTION (ALL NODES)
 # ============================================================================
 
-# Append system volume encryption config only if KMS URL is configured
+# A KMS URL makes encryption mandatory for STATE/EPHEMERAL on every node; existing
+# unencrypted volumes are kept as-is and reported (see lib/volume-encryption.sh).
+TALOS_APPEND_MANIFESTS_ALL_NODES=()
 if [ -n "${TALOS_DISK_ENCRYPTION_KMS_URL:-}" ]; then
-  log_info "Disk encryption enabled (KMS URL: $TALOS_DISK_ENCRYPTION_KMS_URL), appending systemVolumes.yaml"
-  TALOS_APPEND_MANIFESTS_CONTROL_NODES+=("${BASE_DIR}/talos/systemVolumes.yaml")
+  log_info "Disk encryption required (KMS URL: $TALOS_DISK_ENCRYPTION_KMS_URL), merging systemVolumes.yaml into all node configs"
+  TALOS_APPEND_MANIFESTS_ALL_NODES+=("${BASE_DIR}/talos/systemVolumes.yaml")
 else
-  log_info "Disk encryption disabled (TALOS_DISK_ENCRYPTION_KMS_URL is empty), skipping systemVolumes.yaml"
+  log_warn "Disk encryption DISABLED (TALOS_DISK_ENCRYPTION_KMS_URL is empty): node volumes will not be encrypted"
 fi
 
 # ============================================================================
@@ -434,6 +438,7 @@ for NODE in "${TALOS_CONTROL_NODES[@]}"; do
   NODE_HOSTNAME=$(echo "$NODE" | cut -d'.' -f1)
   NODE_CONFIG_FILE="$RENDERED_DIR/talos/controlplane-${NODE_HOSTNAME}.yaml"
   generate_node_config "$NODE" "$OVERLAY_DIR/talos/controlplane.yaml" "$NODE_CONFIG_FILE" "$OVERLAY_DIR" \
+    ${TALOS_APPEND_MANIFESTS_ALL_NODES[@]+"${TALOS_APPEND_MANIFESTS_ALL_NODES[@]}"} \
     ${TALOS_APPEND_MANIFESTS_CONTROL_NODES[@]+"${TALOS_APPEND_MANIFESTS_CONTROL_NODES[@]}"}
 done
 
@@ -442,9 +447,12 @@ if [[ ${#TALOS_WORKER_NODES[@]} -gt 0 ]]; then
   for NODE in "${TALOS_WORKER_NODES[@]}"; do
     NODE_HOSTNAME=$(echo "$NODE" | cut -d'.' -f1)
     NODE_CONFIG_FILE="$RENDERED_DIR/talos/worker-${NODE_HOSTNAME}.yaml"
-    generate_node_config "$NODE" "$OVERLAY_DIR/talos/worker.yaml" "$NODE_CONFIG_FILE" "$OVERLAY_DIR"
+    generate_node_config "$NODE" "$OVERLAY_DIR/talos/worker.yaml" "$NODE_CONFIG_FILE" "$OVERLAY_DIR" \
+      ${TALOS_APPEND_MANIFESTS_ALL_NODES[@]+"${TALOS_APPEND_MANIFESTS_ALL_NODES[@]}"}
   done
 fi
+
+print_volume_encryption_summary "${TALOS_CONTROL_NODES[@]}"
 
 
 
@@ -480,6 +488,7 @@ if [[ "$DIFF_MODE" == "true" ]]; then
       apply_talos_config "$NODE" "$NODE_CONFIG_FILE" "true"
     done
   fi
+  print_volume_encryption_summary "${TALOS_CONTROL_NODES[@]}"
   log_success "Diff complete — no changes were applied."
   exit 0
 fi
@@ -666,5 +675,8 @@ fi
 # #kill $CSR_WATCHER_PID 2>/dev/null || true
 # # Wait for CSR watcher to finish (or timeout)
 # wait $CSR_WATCHER_PID 2>/dev/null || true
+
+# Repeated here so it isn't lost in the bootstrap output
+[[ ${#VOLUME_ENCRYPTION_FINDINGS[@]} -gt 0 ]] && print_volume_encryption_summary "${TALOS_CONTROL_NODES[@]}"
 
 exit $DEPLOY_STATUS
