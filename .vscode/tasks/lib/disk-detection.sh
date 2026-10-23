@@ -217,12 +217,14 @@ provisioning:
   minSize: ${min_size}
 EOF
 
-    # Add encryption if KMS endpoint is provided
+    # Add encryption if KMS endpoint is provided.
+    # allowDiscards lets scheduled fstrim reach the backing device through the LUKS mapping.
     if [ -n "$kms_endpoint" ]; then
 
         cat <<EOF
 encryption:
   provider: luks2
+  allowDiscards: true
   keys:
     - slot: 0
       kms:
