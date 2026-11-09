@@ -2,6 +2,8 @@
 # Plan and optionally execute a one-hop Talos upgrade.
 #
 # Usage: talos-upgrade.sh <environment> <read-only:true|false> <interactive:true|false> [target-version]
+# Longhorn waits refresh every 15s, up to TALOS_UPGRADE_STORAGE_SETTLE_TIMEOUT (seconds).
+# Press q during a terminal Longhorn wait, or Ctrl+C, to stop and restore temporary settings.
 
 set -euo pipefail
 
@@ -271,7 +273,7 @@ crd_present() {
   if grep -qi 'not found\|could not find' <<<"$output"; then
     return 1
   fi
-  log "kubernetes: unable to query CRD $crd: $output"
+  log "kubernetes: unable to query CRD $crd: $output" >&2
   return 2
 }
 
@@ -280,17 +282,17 @@ crd_present() {
 longhorn_unhealthy_volumes() {
   local target_node="${1:-}" volumes_json replicas_json scope='null'
 
-  volumes_json=$(kubectl -n longhorn-system get volumes.longhorn.io -o json 2>/dev/null) ||
-    { log 'longhorn: unable to query volume robustness'; return 1; }
+  volumes_json=$(kubectl -n longhorn-system get volumes.longhorn.io -o json) ||
+    { log 'longhorn: unable to query volume robustness' >&2; return 1; }
 
   if [[ -n "$target_node" ]]; then
-    replicas_json=$(kubectl -n longhorn-system get replicas.longhorn.io -o json 2>/dev/null) ||
-      { log 'longhorn: unable to query replica placement'; return 1; }
+    replicas_json=$(kubectl -n longhorn-system get replicas.longhorn.io -o json) ||
+      { log 'longhorn: unable to query replica placement' >&2; return 1; }
     # failedAt marks a replica Longhorn has already written off, so it is not at risk here.
     scope=$(jq -c --arg node "$target_node" \
       '[.items[] | select(.spec.nodeID == $node and (.spec.failedAt // "") == "") | .spec.volumeName]' \
       <<<"$replicas_json") ||
-      { log 'longhorn: unable to parse replica placement'; return 1; }
+      { log 'longhorn: unable to parse replica placement' >&2; return 1; }
   fi
 
   jq -r --argjson scope "$scope" '
@@ -299,17 +301,61 @@ longhorn_unhealthy_volumes() {
     | . as $volume
     | select($scope == null or ($scope | index($volume.metadata.name) != null))
     | "\($volume.metadata.name) \($volume.status.robustness)"' <<<"$volumes_json" ||
-    { log 'longhorn: unable to parse volume robustness'; return 1; }
+    { log 'longhorn: unable to parse volume robustness' >&2; return 1; }
+}
+
+longhorn_rebuild_progress() {
+  local unhealthy="$1" replicas_json engines_json
+  replicas_json=$(kubectl -n longhorn-system get replicas.longhorn.io -o json) ||
+    { log 'longhorn: unable to query replica progress' >&2; return 1; }
+  engines_json=$(kubectl -n longhorn-system get engines.longhorn.io -o json) ||
+    { log 'longhorn: unable to query engine rebuild progress' >&2; return 1; }
+
+  jq -nr --arg unhealthy "$unhealthy" --argjson replicas "$replicas_json" --argjson engines "$engines_json" '
+    $unhealthy | split("\n")[] | split(" ")[0] as $volume
+    | "  volume \($volume):",
+      ($replicas.items[] | select(.spec.volumeName == $volume)
+       | "    replica \(.metadata.name) node=\(.spec.nodeID // "unassigned") state=\(.status.currentState // "unknown")\(if (.spec.failedAt // "") != "" then " failedAt=\(.spec.failedAt)" else "" end)"),
+      ([$engines.items[] | select(.spec.volumeName == $volume) | . as $engine
+        | (.status.rebuildStatus // {} | to_entries[])
+        | . as $rebuild
+        | (($engine.spec.replicaAddressMap // {}) + ($engine.status.currentReplicaAddressMap // {})
+           | to_entries | map(select(.value == ($rebuild.key | sub("^tcp://"; ""))))
+           | first | .key) as $replica
+        | "    rebuild \($replica // $rebuild.key): \(if $rebuild.value.progress == null then "progress unavailable" else "\($rebuild.value.progress)%" end) state=\($rebuild.value.state // "unknown")\(if ($rebuild.value.error // "") != "" then " error=\($rebuild.value.error)" else "" end)"]
+       | if length == 0 then "    rebuild progress unavailable (waiting for Longhorn to report a rebuild)" else .[] end)' ||
+    { log 'longhorn: unable to parse rebuild progress' >&2; return 1; }
+}
+
+cancel_upgrade() {
+  log "Upgrade cancelled ($2). No further nodes will be upgraded; restoring temporary settings."
+  log 'Already-started node upgrades are not rolled back; check node health before rerunning.'
+  exit "$1"
+}
+
+longhorn_poll_pid=''
+wait_for_longhorn_poll() {
+  local key
+  if [[ -t 0 ]]; then
+    if IFS= read -r -s -n 1 -t 15 key; then
+      case "$key" in
+        q|Q) cancel_upgrade 130 'operator pressed q' ;;
+      esac
+    fi
+  else
+    # wait is interruptible by traps, unlike a foreground sleep.
+    sleep 15 &
+    longhorn_poll_pid=$!
+    wait "$longhorn_poll_pid"
+    longhorn_poll_pid=''
+  fi
 }
 
 # Rebooting a node takes its replicas offline, so a volume that is already degraded and has
 # a replica here can drop below a safe replica count. Volumes rebuilding on other nodes are
 # unaffected by this node, so don't block on them.
 wait_for_longhorn_healthy() {
-  local target_node="${1:-}" deadline unhealthy count scope_label volume_line crd_rc=0
-  crd_present volumes.longhorn.io || crd_rc=$?
-  [[ "$crd_rc" -eq 1 ]] && return 0
-  [[ "$crd_rc" -eq 0 ]] || return 1
+  local target_node="${1:-}" deadline unhealthy count scope_label volume_line crd_rc waiting=false installed=false
   if [[ -n "$target_node" ]]; then
     scope_label="with a replica on $target_node"
   else
@@ -317,19 +363,34 @@ wait_for_longhorn_healthy() {
   fi
   deadline=$(( $(date +%s) + STORAGE_SETTLE_TIMEOUT ))
   while true; do
-    unhealthy=$(longhorn_unhealthy_volumes "$target_node") || return 1
-    if [[ -z "$unhealthy" ]]; then
-      return 0
+    crd_rc=0
+    if [[ "$installed" == false ]]; then
+      crd_present volumes.longhorn.io || crd_rc=$?
+      [[ "$crd_rc" -eq 1 ]] && return 0
+      [[ "$crd_rc" -ne 0 ]] || installed=true
     fi
-    count=$(wc -l <<<"$unhealthy")
-    if [[ $(date +%s) -ge $deadline ]]; then
-      log "longhorn: $count volume(s) $scope_label still degraded after ${STORAGE_SETTLE_TIMEOUT}s"
+    if [[ "$crd_rc" -eq 0 ]] && unhealthy=$(longhorn_unhealthy_volumes "$target_node"); then
+      if [[ -z "$unhealthy" ]]; then
+        [[ "$waiting" == false ]] || log "longhorn: all volumes $scope_label are healthy"
+        return 0
+      fi
+      count=$(wc -l <<<"$unhealthy")
+      log "longhorn: waiting for $count volume(s) $scope_label to finish rebuilding"
       while IFS= read -r volume_line; do log "  $volume_line"; done <<<"$unhealthy"
+      longhorn_rebuild_progress "$unhealthy" ||
+        log 'longhorn: rebuild progress could not be read; retrying on the next refresh'
+    else
+      log 'longhorn: unable to confirm volume health; retrying without upgrading any node'
+    fi
+    if [[ "$waiting" == false ]]; then
+      log 'longhorn: refreshing every 15s; Ctrl+C (or q in a terminal) cancels and restores temporary settings'
+      waiting=true
+    fi
+    if [[ $(date +%s) -ge $deadline ]]; then
+      log "longhorn: volumes $scope_label not confirmed healthy after ${STORAGE_SETTLE_TIMEOUT}s"
       return 1
     fi
-    log "longhorn: waiting for $count volume(s) $scope_label to finish rebuilding"
-    while IFS= read -r volume_line; do log "  $volume_line"; done <<<"$unhealthy"
-    sleep 15
+    wait_for_longhorn_poll
   done
 }
 
@@ -461,9 +522,12 @@ restore_longhorn_policy=""
 restore_longhorn_drain_policy() {
   [[ -n "$restore_longhorn_policy" ]] || return 0
   log "Restoring Longhorn node-drain-policy to '$restore_longhorn_policy'"
-  kubectl patch settings.longhorn.io node-drain-policy -n longhorn-system \
+  kubectl --request-timeout=30s patch settings.longhorn.io node-drain-policy -n longhorn-system \
     --type merge -p "{\"value\":\"$restore_longhorn_policy\"}" >/dev/null ||
-    printf '[talos-upgrade] WARNING: failed to restore Longhorn node-drain-policy to %s\n' "$restore_longhorn_policy" >&2
+    {
+      printf '[talos-upgrade] ERROR: failed to restore Longhorn node-drain-policy; restore manually to %s\n' "$restore_longhorn_policy" >&2
+      return 1
+    }
   restore_longhorn_policy=""
 }
 
@@ -475,34 +539,54 @@ pause_argocd_autosync() {
     namespace="${app%%/*}"
     name="${app##*/}"
     automated=$(kubectl -n "$namespace" get application "$name" -o json 2>/dev/null |
-      jq -c '.spec.syncPolicy.automated') || automated=''
+      jq -c '.spec.syncPolicy.automated') || fail "unable to save ArgoCD auto-sync settings for $app"
     [[ -n "$automated" && "$automated" != null ]] || continue
     log "Pausing ArgoCD auto-sync for $app"
+    restore_argocd_automated["$app"]="$automated"
     kubectl -n "$namespace" patch application "$name" --type merge \
       -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null ||
       fail "failed to pause ArgoCD auto-sync for $app"
-    restore_argocd_automated["$app"]="$automated"
   done
 }
 
 restore_argocd_autosync() {
   [[ ${#restore_argocd_automated[@]} -gt 0 ]] || return 0
-  local app namespace name
+  local app namespace name failed=0
   for app in "${!restore_argocd_automated[@]}"; do
     namespace="${app%%/*}"
     name="${app##*/}"
     log "Re-enabling ArgoCD auto-sync for $app"
-    kubectl -n "$namespace" patch application "$name" --type merge \
-      -p "{\"spec\":{\"syncPolicy\":{\"automated\":${restore_argocd_automated[$app]}}}}" >/dev/null ||
-      printf '[talos-upgrade] WARNING: failed to re-enable ArgoCD auto-sync for %s\n' "$app" >&2
+    if kubectl --request-timeout=30s -n "$namespace" patch application "$name" --type merge \
+      -p "{\"spec\":{\"syncPolicy\":{\"automated\":${restore_argocd_automated[$app]}}}}" >/dev/null; then
+      unset 'restore_argocd_automated[$app]'
+    else
+      printf '[talos-upgrade] ERROR: failed to restore ArgoCD auto-sync for %s; restore spec.syncPolicy.automated manually to %s\n' \
+        "$app" "${restore_argocd_automated[$app]}" >&2
+      failed=1
+    fi
   done
-  restore_argocd_automated=()
+  return "$failed"
 }
 
 # Restore the drain policy first so ArgoCD reconciles against the original value.
 cleanup() {
-  restore_longhorn_drain_policy
-  restore_argocd_autosync
+  local failed=0
+  if [[ -n "$longhorn_poll_pid" ]]; then
+    kill "$longhorn_poll_pid" 2>/dev/null || true
+    wait "$longhorn_poll_pid" 2>/dev/null || true
+    longhorn_poll_pid=''
+  fi
+  restore_longhorn_drain_policy || failed=1
+  restore_argocd_autosync || failed=1
+  return "$failed"
+}
+
+on_upgrade_exit() {
+  local exit_code=$?
+  trap - EXIT
+  trap '' INT TERM
+  cleanup || { [[ "$exit_code" -ne 0 ]] || exit_code=1; }
+  exit "$exit_code"
 }
 
 normalize_version() {
@@ -812,8 +896,9 @@ ask "Type the cluster name ($TALOS_CLUSTER_NAME) to continue: " typed_cluster_na
 [[ -n "$typed_cluster_name" && "$typed_cluster_name" == "$TALOS_CLUSTER_NAME" ]] ||
   fail 'cluster name confirmation did not match'
 
-trap cleanup EXIT
-trap 'fail "interrupted by signal"' INT TERM
+trap on_upgrade_exit EXIT
+trap 'cancel_upgrade 130 "Ctrl+C / SIGINT"' INT
+trap 'cancel_upgrade 143 "SIGTERM"' TERM
 
 log 'Pre-flight: etcd health'
 check_etcd_health || fail 'etcd is not healthy; refusing to start the upgrade'
@@ -863,10 +948,10 @@ if [[ -n "$current_drain_policy" ]]; then
           fi
         fi
         if [[ "$argocd_ready" == true ]]; then
+          restore_longhorn_policy="$current_drain_policy"
           kubectl patch settings.longhorn.io node-drain-policy -n longhorn-system \
             --type merge -p '{"value":"block-for-eviction-if-contains-last-replica"}' >/dev/null ||
             fail 'failed to update the Longhorn node-drain-policy'
-          restore_longhorn_policy="$current_drain_policy"
           policy_switched=true
           log 'Longhorn will now relocate last replicas automatically; expect considerably longer drains.'
         fi
@@ -952,7 +1037,7 @@ for node in "${upgrade_order[@]}"; do
   log "$node upgraded and validated."
 done
 
-cleanup
+cleanup || fail 'unable to restore temporary settings after upgrading; see errors above'
 
 printf '\n────────────────────────────────────────────────────────────\n'
 printf '  Final cluster validation\n'
