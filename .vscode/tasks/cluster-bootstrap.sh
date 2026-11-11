@@ -31,6 +31,7 @@ if [ $# -ne 1 ]; then
 fi
 
 env_name="$1"
+[[ "$env_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "Invalid environment name" >&2; exit 2; }
 
 : "${TALOS_BOOTSTRAPPER_DATA_DIR:?TALOS_BOOTSTRAPPER_DATA_DIR must be set (see .devcontainer/devcontainer.json)}"
 export TALOS_BOOTSTRAPER_DIR="${TALOS_BOOTSTRAPER_DIR:-$TALOS_BOOTSTRAPPER_DATA_DIR/talos-bootstraper}"
@@ -102,6 +103,10 @@ cd "$OVERLAY_DIR" || exit 1
 log_info "Setting up kubeconfig for kubectl and helm..."
 talosctl kubeconfig --merge --force --nodes "${TALOS_CONTROL_NODES[0]}" ~/.kube/config
 export KUBECONFIG="$(cd ~/.kube && pwd)/config"
+
+# Before the first cluster/bootstrap mutation. The Kubernetes API must already
+# be up here; a reachable API without Argo's CRD is a fresh bootstrap, not failure.
+"$SCRIPT_DIR/run-deployment-hooks.sh" "$CONFIG_FILE" beforeArgo
 
 # ============================================================================
 # HELM REPOSITORY SETUP
@@ -217,9 +222,23 @@ if [[ "$GITEA_ALREADY_BOOTSTRAPPED" == "false" ]]; then
   #kubectl apply -f "$BASE_DIR/argocd/bootstrap/bootstrapGitServer.yaml"
   kubectl wait --for=condition=Ready pod/git-bootstrap-server -n argocd
 
-  # Copy overlay directory to git-bootstrap-server pod (only overlay content, not the full repo)
-  log_info "Copying overlay directory to git-bootstrap-server pod"
-  kubectl cp "$OVERLAY_DIR/." "argocd/git-bootstrap-server:/tmp/gitsrc"
+  # Revalidate immediately before publication; never copy raw overlays, Talos
+  # secrets, or hook scripts into the bootstrap Git repository.
+  "$SCRIPT_DIR/run-deployment-hooks.sh" "$CONFIG_FILE" beforeArgo \
+    "GITEA_CLUSTER_SERVICES_REPO_URL=$OVERRIDE_GITEA_CLUSTER_SERVICES_REPO_URL" \
+    "GITEA_CLUSTER_SERVICES_REPO_BRANCH=$OVERRIDE_GITEA_CLUSTER_SERVICES_BRANCH_NAME"
+  publish_dir="$(mktemp -d)"
+  trap 'rm -rf "$publish_dir"' EXIT
+  mkdir -p "$publish_dir/_rendered"
+  rsync -a --exclude '/talos/' --exclude '/deploymentHooks/' "$RENDERED_OVERLAY_DIR/" "$publish_dir/_rendered/"
+  if [[ -d "$OVERLAY_DIR/.gitea/workflows" ]]; then
+    mkdir -p "$publish_dir/.gitea"
+    cp -a "$OVERLAY_DIR/.gitea/workflows" "$publish_dir/.gitea/"
+  fi
+  log_info "Copying publication-only manifests to git-bootstrap-server pod"
+  kubectl cp "$publish_dir/." "argocd/git-bootstrap-server:/tmp/gitsrc"
+  rm -rf "$publish_dir"
+  trap - EXIT
   kubectl cp "$BASE_DIR/argocd/bootstrap/commitAndPush.sh" "argocd/git-bootstrap-server:/tmp/commitAndPush.sh"
 
   if ! kubectl exec -n argocd git-bootstrap-server -- test -d /tmp/gitsrc; then

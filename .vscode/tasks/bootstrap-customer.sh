@@ -281,6 +281,7 @@ YAML
 
     # Also commit it directly to the Gitea cluster-services repo via the API
     # so ArgoCD picks it up immediately without waiting for the next push.
+    "$SCRIPT_DIR/run-deployment-hooks.sh" "$env_file" beforeArgo
     create_or_update_gitea_file \
         "$cluster_services_owner" \
         "$cluster_services_repo" \
