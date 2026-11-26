@@ -31,7 +31,7 @@ source "$SCRIPT_DIR/lib/logging.sh" \
 # Usage message
 usage() {
     cat <<EOF
-Usage: $(basename "$0") <ENV_FILE> [VAR=value ...] [--dry-run]
+Usage: $(basename "$0") <ENV_FILE> [VAR=value ...] [--dry-run] [--output-dir DIR]
 
 Arguments:
   ENV_FILE    Path to the environment file (e.g. talos/overlays/yourCluster/yourCluster.env)
@@ -53,6 +53,7 @@ EOF
 # Check required tools
 check_dependencies() {
     local missing=()
+    command -v python3 &>/dev/null || missing+=("python3 (deployment hook inventory)")
     
     if ! command -v yq &>/dev/null; then
         missing+=("yq (https://github.com/mikefarah/yq)")
@@ -165,10 +166,11 @@ collect_base_files() {
     fi
     
     # Iterate through immediate subdirectories of base
-    for component_dir in "$base_dir"/*; do
+    for component_dir in "$base_dir"/*(N); do
         [[ ! -d "$component_dir" ]] && continue
         
         local component_name=$(basename "$component_dir")
+        [[ "$component_name" == "deploymentHooks" ]] && continue
         
         # Find YAML files at depth 1 in this component
         while IFS= read -r file; do
@@ -191,10 +193,11 @@ collect_overlay_files() {
     
     # Iterate through immediate subdirectories of overlay
     # Exclude directories ending with "-rendered"
-    for component_dir in "$overlay_dir"/*; do
+    for component_dir in "$overlay_dir"/*(N); do
         [[ ! -d "$component_dir" ]] && continue
         
         local component_name=$(basename "$component_dir")
+        [[ "$component_name" == "deploymentHooks" ]] && continue
         
         # Skip rendered output directory
         [[ "$component_name" == "_rendered" ]] && continue
@@ -268,10 +271,15 @@ render_yaml() {
     mkdir -p "$(dirname "$output_file")"
     
     # Render with envsubst
-    # Use || true to avoid failures from set -e if envsubst encounters issues
     if ! envsubst "$ENVSUBST_VARS" < "$input_file" > "$output_file" 2>/dev/null; then
-        log_warn "envsubst failed for $input_file, copying as-is"
-        cp "$input_file" "$output_file"
+        log_error "envsubst failed for $input_file"
+        return 1
+    fi
+    # Talos includes deferred templates (e.g. CA_CERT_BODY) completed by its
+    # existing entrypoints later. Do not change that contract or validate them
+    # as Argo publication manifests.
+    if [[ "$output_file" != */_rendered/talos/* ]]; then
+        yq e '.' "$output_file" >/dev/null
     fi
 }
 
@@ -295,13 +303,15 @@ merge_yaml_files() {
     local overlay_rendered=$(mktemp)
     
     if ! envsubst "$ENVSUBST_VARS" < "$base_file" > "$base_rendered" 2>/dev/null; then
-        log_warn "envsubst failed for base file $base_file, using as-is"
-        cp "$base_file" "$base_rendered"
+        log_error "envsubst failed for base file $base_file"
+        rm -f "$base_rendered" "$overlay_rendered"
+        return 1
     fi
     
     if ! envsubst "$ENVSUBST_VARS" < "$overlay_file" > "$overlay_rendered" 2>/dev/null; then
-        log_warn "envsubst failed for overlay file $overlay_file, using as-is"
-        cp "$overlay_file" "$overlay_rendered"
+        log_error "envsubst failed for overlay file $overlay_file"
+        rm -f "$base_rendered" "$overlay_rendered"
+        return 1
     fi
     
     # Count documents to decide merge strategy
@@ -348,8 +358,7 @@ merge_yaml_files() {
             if [[ -s "$overlay_match" ]]; then
                 # Matching overlay doc found: merge (overlay wins)
                 yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' \
-                    "$base_doc" "$overlay_match" > "$merged_doc" 2>/dev/null \
-                    || cp "$base_doc" "$merged_doc"
+                    "$base_doc" "$overlay_match" > "$merged_doc"
             else
                 # No match: keep base document unchanged
                 cp "$base_doc" "$merged_doc"
@@ -495,25 +504,18 @@ process_files() {
         
         if [[ -n "$base_file" && -n "$overlay_file" ]]; then
             log_info "[$file_number/${#all_keys[@]}] Merging: $component/$filename (base + overlay)"
-            if merge_yaml_files "$base_file" "$overlay_file" "$output_file" "$dry_run"; then
-                merged_count=$((merged_count + 1))
-            else
-                log_warn "Merge failed, skipping"
-            fi
+            # Unconditional calls keep errexit active throughout the functions.
+            # Never publish an incomplete render after an ignored merge failure.
+            merge_yaml_files "$base_file" "$overlay_file" "$output_file" "$dry_run"
+            merged_count=$((merged_count + 1))
         elif [[ -n "$base_file" ]]; then
             log_info "[$file_number/${#all_keys[@]}] Rendering: $component/$filename (base)"
-            if render_yaml "$base_file" "$output_file" "$dry_run"; then
-                base_only_count=$((base_only_count + 1))
-            else
-                log_warn "Render failed, skipping"
-            fi
+            render_yaml "$base_file" "$output_file" "$dry_run"
+            base_only_count=$((base_only_count + 1))
         elif [[ -n "$overlay_file" ]]; then
             log_info "[$file_number/${#all_keys[@]}] Rendering: $component/$filename (overlay)"
-            if render_yaml "$overlay_file" "$output_file" "$dry_run"; then
-                overlay_only_count=$((overlay_only_count + 1))
-            else
-                log_warn "Render failed, skipping"
-            fi
+            render_yaml "$overlay_file" "$output_file" "$dry_run"
+            overlay_only_count=$((overlay_only_count + 1))
         fi
     done
     
@@ -566,9 +568,10 @@ process_template_dirs() {
         typeset -A pruned
         for scope_root in "$base_dir" "$overlay_dir"; do
             [[ -d "$scope_root" ]] || continue
-            for component_dir in "$scope_root"/*; do
+            for component_dir in "$scope_root"/*(N); do
                 [[ -d "$component_dir/templates" ]] || continue
                 component=$(basename "$component_dir")
+                [[ "$component" == "deploymentHooks" ]] && continue
                 [[ -n "${pruned[$component]:-}" ]] && continue
                 is_excluded "$component" "templates" && continue
                 rm -rf "$output_dir/$component/templates"
@@ -579,9 +582,10 @@ process_template_dirs() {
 
     for scope_root in "$base_dir" "$overlay_dir"; do
         [[ -d "$scope_root" ]] || continue
-        for component_dir in "$scope_root"/*; do
+        for component_dir in "$scope_root"/*(N); do
             [[ -d "$component_dir/templates" ]] || continue
             component=$(basename "$component_dir")
+            [[ "$component" == "deploymentHooks" ]] && continue
 
             while IFS= read -r file; do
                 [[ -n "$file" ]] || continue
@@ -597,8 +601,8 @@ process_template_dirs() {
                 fi
                 mkdir -p "$(dirname "$out")"
                 if ! envsubst "$ENVSUBST_VARS" < "$file" > "$out" 2>/dev/null; then
-                    log_warn "envsubst failed for $file, copying as-is"
-                    cp "$file" "$out"
+                    log_error "envsubst failed for $file"
+                    return 1
                 fi
             done < <(find "$component_dir/templates" -type f 2>/dev/null | sort)
         done
@@ -614,7 +618,7 @@ process_workflows() {
     local overlay_dir="$2"
     local dry_run="$3"
 
-    local wf_out="$overlay_dir/.gitea/workflows"
+    local wf_out="$4/.gitea/workflows"
     local scope_root component_dir component file out base_name
 
     if [[ "$dry_run" == "false" ]]; then
@@ -624,9 +628,10 @@ process_workflows() {
     local wrote_any="false"
     for scope_root in "$base_dir" "$overlay_dir"; do
         [[ -d "$scope_root" ]] || continue
-        for component_dir in "$scope_root"/*; do
+        for component_dir in "$scope_root"/*(N); do
             [[ -d "$component_dir/workflows" ]] || continue
             component=$(basename "$component_dir")
+            [[ "$component" == "deploymentHooks" ]] && continue
 
             while IFS= read -r file; do
                 [[ -n "$file" ]] || continue
@@ -643,9 +648,10 @@ process_workflows() {
                 fi
                 mkdir -p "$wf_out"
                 if ! envsubst "$ENVSUBST_VARS" < "$file" > "$out" 2>/dev/null; then
-                    log_warn "envsubst failed for $file, copying as-is"
-                    cp "$file" "$out"
+                    log_error "envsubst failed for $file"
+                    return 1
                 fi
+                yq e '.' "$out" >/dev/null
                 wrote_any="true"
             done < <(find "$component_dir/workflows" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort)
         done
@@ -670,11 +676,16 @@ main() {
     shift
     
     local dry_run="false"
+    local requested_output=""
     local -a env_overrides=()
     
     # Parse remaining arguments for overrides and --dry-run
     while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "--dry-run" ]]; then
+        if [[ "$1" == "--output-dir" ]]; then
+            [[ $# -ge 2 && -n "$2" ]] || usage
+            requested_output="$2"
+            shift
+        elif [[ "$1" == "--dry-run" ]]; then
             dry_run="true"
         elif [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*=.* ]]; then
             # This is an environment variable override (VAR=value format)
@@ -701,6 +712,8 @@ main() {
     check_dependencies
     
     # Load environment
+    # A missing exclusions array means no exclusions (also under nounset).
+    local -a EXCLUDED_BASE=()
     load_env_file "$env_file"
     
     # Apply environment variable overrides
@@ -732,7 +745,14 @@ main() {
     # Output rendered files into _rendered/ inside the overlay directory.
     # This keeps rendered output co-located with the overlay config so that
     # overlay submodules are self-contained for ArgoCD.
-    local output_dir="$overlay_dir/_rendered"
+    local output_dir="${requested_output:-$overlay_dir/_rendered}"
+    # Check before :A resolves symlinks, otherwise the guard would be bypassed.
+    [[ ! -L "$output_dir" ]] || { log_error "Output must not be a symlink"; exit 1; }
+    output_dir="${output_dir:A}"
+    # Only an _rendered directory is eligible for generated-output cleanup.
+    [[ "${output_dir:t}" == "_rendered" && ! -L "$output_dir" ]] || {
+        log_error "Output must be a non-symlink _rendered directory"; exit 1;
+    }
     
     log_info "Repository root:   $talos_submodule_root"
     log_info "Base directory:    $base_dir"
@@ -740,13 +760,25 @@ main() {
     log_info "Output directory:  $output_dir"
     echo ""
     
+    # Rebuild generated non-Talos trees so exclusions/removals cannot publish
+    # stale manifests. Talos configs are generated elsewhere and stay untouched.
+    if [[ "$dry_run" == "false" && -d "$output_dir" ]]; then
+        local generated
+        for generated in "$output_dir"/*(N); do
+            [[ "${generated:t}" == "talos" ]] && continue
+            rm -rf -- "$generated"
+        done
+    fi
     # Process files
     process_files "$talos_submodule_root" "$base_dir" "$overlay_dir" "$output_dir" "$dry_run"
 
     # Render non-manifest template trees (e.g. Coder Terraform) and flatten
     # Gitea Actions workflows into <env>/.gitea/workflows/.
     process_template_dirs "$base_dir" "$overlay_dir" "$output_dir" "$dry_run"
-    process_workflows "$base_dir" "$overlay_dir" "$dry_run"
+    process_workflows "$base_dir" "$overlay_dir" "$dry_run" "${output_dir:h}"
+    if [[ "$dry_run" == "false" ]]; then
+        python3 "$SCRIPT_DIR/lib/deployment-hooks.py" copy "$base_dir" "$overlay_dir" "$output_dir" "${EXCLUDED_BASE[@]:-}"
+    fi
 }
 
 main "$@"

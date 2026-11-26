@@ -308,6 +308,11 @@ main() {
     if [[ -z "${KUBECONFIG:-}" ]]; then
         export KUBECONFIG="$HOME/.kube/config"
     fi
+    # Full bootstrap can publish Argo deployment content. Integration-only
+    # modes do not publish manifests and are not deployment entrypoints.
+    if [[ "$coder_integration_only" == "false" && "$coder_token_only" == "false" && "$registry_pull_only" == "false" ]]; then
+        "$SCRIPT_DIR/run-deployment-hooks.sh" "$env_file" beforeArgo
+    fi
     
     log_info "Script directory: $SCRIPT_DIR"
     log_info "Overlay directory: $OVERLAY_DIR"

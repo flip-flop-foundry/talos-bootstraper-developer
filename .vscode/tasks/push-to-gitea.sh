@@ -20,6 +20,14 @@
 set -euo pipefail
 
 env_name="${1:?environment name is required}"
+[[ $# -le 2 && "$env_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "Invalid environment/arguments" >&2; exit 2; }
+if [[ "${2:-}" == --dry-run ]]; then
+  echo "[DRY-RUN] No hooks, credentials, clone or publication"
+  exit 0
+elif [[ $# -eq 2 ]]; then
+  echo "Unknown argument: $2" >&2
+  exit 2
+fi
 
 : "${TALOS_BOOTSTRAPPER_DATA_DIR:?TALOS_BOOTSTRAPPER_DATA_DIR must be set (see .devcontainer/devcontainer.json)}"
 
@@ -29,11 +37,6 @@ rendered_dir="$env_dir/_rendered"
 
 if [[ ! -f "$env_file" ]]; then
   echo "ERROR: env file not found: $env_file" >&2
-  exit 1
-fi
-if [[ ! -d "$rendered_dir" ]]; then
-  echo "ERROR: rendered directory not found: $rendered_dir" >&2
-  echo "       Run the 'Render Overlay' task first." >&2
   exit 1
 fi
 
@@ -51,6 +54,10 @@ source "$SCRIPT_DIR/lib/logging.sh" \
 # shellcheck source=./lib/gitea-api.sh
 source "$SCRIPT_DIR/lib/gitea-api.sh" \
   || { echo "ERROR: failed to load $SCRIPT_DIR/lib/gitea-api.sh" >&2; exit 1; }
+
+# Publication always derives desired state and hook discovery from current sources.
+"$SCRIPT_DIR/render-overlay.sh" "$env_file"
+"$SCRIPT_DIR/run-deployment-hooks.sh" "$env_file" beforeArgo
 
 # --- fetch credentials from cluster ---
 log_info "Fetching Gitea admin credentials from cluster ($GITEA_NAMESPACE/${GITEA_ADMIN_SECRET:-gitea-bootstrap-admin-secret})"
@@ -87,7 +94,7 @@ git -C "$tmp_repo" config user.name  "render-and-push (${env_name})"
 log_info "Syncing $rendered_dir/ -> $tmp_repo/_rendered/"
 # talos/ holds machine configs and cluster secrets and is not consumed by ArgoCD;
 # --delete-excluded also purges copies pushed by older versions of this script.
-rsync -a --delete --delete-excluded --exclude '/talos/' "$rendered_dir/" "$tmp_repo/_rendered/"
+rsync -a --delete --delete-excluded --exclude '/talos/' --exclude '/deploymentHooks/' "$rendered_dir/" "$tmp_repo/_rendered/"
 
 # Only stage files under _rendered/. Nothing else can ever get committed.
 git -C "$tmp_repo" add -A -- _rendered/
