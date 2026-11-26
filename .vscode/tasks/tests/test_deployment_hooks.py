@@ -1,6 +1,5 @@
 """Offline hook/renderer/publication tests. Never uses live Kubernetes or Gitea."""
 import json
-import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -23,16 +22,19 @@ MOCK_KUBECTL = r'''#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
 args = sys.argv[1:]
-# Kustomize is a local build, not an API operation; use the actual installed
-# client to validate real transformations while mocking every API call.
-if args and args[0] == "kustomize":
-    import shutil
-    real = shutil.which("kubectl", path=os.environ["REAL_PATH"])
-    os.execv(real, [real, *args])
 statefile = Path(os.environ["MOCK_STATE"])
 state = json.loads(statefile.read_text())
 with open(os.environ["MOCK_CALLS"], "a") as log:
     log.write(json.dumps(args) + "\n")
+# Remote upstream Kustomize build: serve an offline fixture, never the network.
+if args and args[0] == "kustomize":
+    expected = "https://github.com/kubernetes-sigs/gateway-api/config/crd?ref="
+    bundle = Path(os.environ["MOCK_GATEWAY_BUNDLE"])
+    if not args[1].startswith(expected) or not bundle.exists():
+        print("error: unable to fetch " + args[1], file=sys.stderr)
+        sys.exit(1)
+    print(bundle.read_text())
+    sys.exit(0)
 while args and (args[0] == "--context" or args[0].startswith("--request-timeout=")):
     if args[0] == "--context":
         del args[:2]
@@ -131,6 +133,18 @@ def crd(name="gateways", owner="traefik_traefik", channel="standard", version="v
             "status": {"storedVersions": ["v1"]}}
 
 
+def bundle_crd(name, version="v1.6.3", channel="standard", versions=("v1",)):
+    return {"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": {"name": f"{name}.{GROUP}", "annotations": {
+                "gateway.networking.k8s.io/channel": channel, "gateway.networking.k8s.io/bundle-version": version}},
+            "spec": {"group": GROUP, "versions": [{"name": v, "served": True, "storage": i == 0}
+                                                  for i, v in enumerate(versions)]}}
+
+
+def write_bundle(path, crds):
+    path.write_text("\n---\n".join(json.dumps(x) for x in crds) + "\n")
+
+
 def default_state():
     return {
         "app": {"metadata": {"name": "traefik", "namespace": "traefik", "resourceVersion": "1"},
@@ -158,7 +172,8 @@ class Fixture(unittest.TestCase):
         self.envfile.write_text('export OVERLAY_NAME="demo"\nexport TALOS_CLUSTER_NAME="demo"\n'
                                 'export TALOS_CLUSTER_ENDPOINT="demo.example"\nexport TOKEN="substitution"\n'
                                 'export GITEA_CLUSTER_SERVICES_REPO_URL="https://git.example/cluster/services.git"\n'
-                                'export GITEA_CLUSTER_SERVICES_REPO_BRANCH="main"\n')
+                                'export GITEA_CLUSTER_SERVICES_REPO_BRANCH="main"\n'
+                                'export GATEWAY_API_VERSION="v1.6.3"\n')
         self.bin = self.root / "bin"
         self.bin.mkdir()
         (self.bin / "kubectl").write_text(MOCK_KUBECTL)
@@ -166,8 +181,9 @@ class Fixture(unittest.TestCase):
         self.statefile = self.root / "state.json"
         self.callsfile = self.root / "calls.jsonl"
         self.write_state(default_state())
-        self.env = dict(os.environ, PATH=str(self.bin) + ":" + os.environ["PATH"],
-                        REAL_PATH=os.environ["PATH"],
+        self.bundle = self.root / "gateway-bundle.yaml"
+        write_bundle(self.bundle, [bundle_crd(n, versions=("v1", "v1beta1")) for n in NAMES])
+        self.env = dict(os.environ, MOCK_GATEWAY_BUNDLE=str(self.bundle), REAL_PATH=os.environ["PATH"], PATH=str(self.bin) + ":" + os.environ["PATH"],
                         TALOS_BOOTSTRAPPER_DATA_DIR=str(self.data), TALOS_BOOTSTRAPER_DIR=str(self.repo),
                         MOCK_STATE=str(self.statefile), MOCK_CALLS=str(self.callsfile),
                         HOOK_KUBE_CONTEXT="admin@demo", ARGOCD_NAMESPACE="argocd",
@@ -507,33 +523,25 @@ class MigrationTests(Fixture):
     def setUp(self):
         super().setUp()
         self.rendered = self.root / "_rendered"
-        self.bundle = self.rendered / "gatewayApi/templates"
-        self.bundle.mkdir(parents=True)
+        (self.rendered / "gatewayApi").mkdir(parents=True)
         self.env["HOOK_RENDERED_DIR"] = str(self.rendered)
         self.env.update(GATEWAY_API_MIGRATION_APPROVED="true", GATEWAY_API_MIGRATION_POLL_SECONDS="0",
                         GATEWAY_API_MIGRATION_TIMEOUT_SECONDS="5")
-        self.files = []
-        for name in NAMES:
-            file = self.bundle / f"{GROUP}_{name}.yaml"
-            file.write_bytes((BASE_REPO / "base/gatewayApi/templates" / file.name).read_bytes())
-            self.files.append(file.name)
-        vap = self.bundle / f"{GROUP}_vap_safeupgrades.yaml"
-        vap.write_bytes((BASE_REPO / "base/gatewayApi/templates" / vap.name).read_bytes())
-        self.files.append(vap.name)
-        self.kustomization = self.bundle / "kustomization.yaml"
-        self.kustomization.write_text(json.dumps({"apiVersion": "kustomize.config.k8s.io/v1beta1", "kind": "Kustomization",
-                                                 "resources": self.files, "commonAnnotations": {SYNC: "Prune=false,Delete=false"}}))
-        gateway = self.rendered / "gatewayApi/gatewayApiArgoApp.yaml"
-        gateway.write_text(json.dumps({"kind": "Application", "metadata": {"name": "gateway-api", "namespace": "argocd"},
-                                      "spec": {"source": {"path": "_rendered/gatewayApi/templates",
-                                                          "repoURL": self.env["GITEA_CLUSTER_SERVICES_REPO_URL"],
-                                                          "targetRevision": "main"},
-                                               "destination": {"server": "https://kubernetes.default.svc"},
-                                               "syncPolicy": {"syncOptions": ["ServerSideApply=true"]}}}))
-        self.gateway = gateway
+        self.gateway = self.rendered / "gatewayApi/gatewayApiArgoApp.yaml"
+        self.set_gateway()
         self.traefik = self.rendered / "traefik/traefikArgoApp.yaml"
         self.traefik.parent.mkdir()
         self.set_chart("42.3.1")
+
+    def set_gateway(self, **source):
+        spec = {"repoURL": "https://github.com/kubernetes-sigs/gateway-api.git", "path": "config/crd",
+                "targetRevision": "v1.6.3",
+                "kustomize": {"commonAnnotations": {SYNC: "Prune=false,Delete=false"}}}
+        spec.update(source)
+        self.gateway.write_text(json.dumps({"kind": "Application", "metadata": {"name": "gateway-api", "namespace": "argocd"},
+                                            "spec": {"source": spec,
+                                                     "destination": {"server": "https://kubernetes.default.svc"},
+                                                     "syncPolicy": {"syncOptions": ["ServerSideApply=true"]}}}))
 
     def set_chart(self, version, enabled=True):
         automated = {"prune": True, "selfHeal": True}
@@ -756,26 +764,29 @@ class MigrationTests(Fixture):
             self.set_chart(version)
             self.assert_blocked(default_state(), "bundled or unaudited")
 
-    def test_missing_crds_and_unsafe_kustomization_block(self):
-        (self.bundle / self.files[0]).unlink()
-        self.assert_blocked(default_state(), "pinned upstream file")
-        (self.bundle / self.files[0]).write_bytes((BASE_REPO / "base/gatewayApi/templates" / self.files[0]).read_bytes())
-        self.kustomization.write_text(json.dumps({"resources": self.files}))
-        self.assert_blocked(default_state(), "Kustomization must protect")
+    def test_gateway_app_must_render_protected_upstream_standard_bundle(self):
+        for source, expected in (({"repoURL": "https://example.com/fork.git"}, "must use https://github.com/kubernetes-sigs"),
+                                 ({"path": "config/crd/experimental"}, "must use https://github.com/kubernetes-sigs"),
+                                 ({"targetRevision": "${GATEWAY_API_VERSION}"}, "release tag like"),
+                                 ({"targetRevision": "main"}, "release tag like"),
+                                 ({"kustomize": {}}, "commonAnnotations")):
+            self.set_gateway(**source)
+            self.assert_blocked(default_state(), expected)
+        self.set_gateway(targetRevision="a" * 40)
+        result = self.migrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Target bundle: standard v1.6.3", result.stdout)
 
-    def test_overlay_kustomization_cannot_undo_resource_protection(self):
-        config = json.loads(self.kustomization.read_text())
-        config["patches"] = [{"target": {"kind": "CustomResourceDefinition", "name": "gateways." + GROUP},
-                              "patch": '[{"op":"remove","path":"/metadata/annotations/argocd.argoproj.io~1sync-options"}]'}]
-        self.kustomization.write_text(json.dumps(config))
-        self.assert_blocked(default_state(), "kubectl kustomize")
-
-    def test_overlay_kustomization_cannot_change_pinned_schema(self):
-        config = json.loads(self.kustomization.read_text())
-        config["patches"] = [{"target": {"kind": "CustomResourceDefinition", "name": "gateways." + GROUP},
-                              "patch": '[{"op":"replace","path":"/spec/group","value":"danger.example"}]'}]
-        self.kustomization.write_text(json.dumps(config))
-        self.assert_blocked(default_state(), "preserve CRD protection and pinned upstream schemas")
+    def test_upstream_bundle_fetch_or_content_problems_block_before_writes(self):
+        self.bundle.unlink()
+        self.assert_blocked(default_state(), "unable to fetch")
+        for crds, expected in (([bundle_crd("gateways", channel="experimental")], "not the standard channel"),
+                               ([bundle_crd("gateways", version="v1.6.2")], "does not match"),
+                               ([bundle_crd("gateways"), bundle_crd("httproutes", version="v1.6.2")], "inconsistent"),
+                               ([], "contains no CRDs")):
+            write_bundle(self.bundle, crds)
+            self.assert_blocked(default_state(), expected)
+        self.assertFalse(any("patch" in call for call in self.calls()))
 
     def test_conflicting_options_fail_without_overwriting_them(self):
         state = default_state()
@@ -791,14 +802,7 @@ class MigrationTests(Fixture):
             state.update(flags)
             self.assert_blocked(state, expected)
 
-    def test_real_pinned_sources_match_documented_hashes_and_instructions_mirror(self):
-        component = BASE_REPO / "base/gatewayApi"
-        hashes = dict(re.findall(r"\| ([a-z_]+\.yaml) \| ([a-f0-9]{64}) \|", (component / "README.md").read_text()))
-        self.assertEqual(len(hashes), 11)
-        for suffix, digest in hashes.items():
-            file = component / "templates" / f"{GROUP}_{suffix}"
-            self.assertEqual(hashlib.sha256(file.read_bytes()).hexdigest(), digest, file.name)
-        self.assertIn("Apache License", (component / "UPSTREAM-LICENSE").read_text())
+    def test_instruction_mirrors_are_identical(self):
         self.assertEqual((BASE_REPO / "CLAUDE.md").read_bytes(), (BASE_REPO / ".github/copilot-instructions.md").read_bytes())
 
 
