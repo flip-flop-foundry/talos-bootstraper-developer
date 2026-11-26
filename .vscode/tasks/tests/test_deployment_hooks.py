@@ -618,6 +618,17 @@ class MigrationTests(Fixture):
     def test_approval_is_required_before_any_write(self):
         del self.env["GATEWAY_API_MIGRATION_APPROVED"]
         self.assert_blocked(default_state(), "approval required")
+        # Also when Traefik auto-sync is already off/absent, or Traefik already runs
+        # the target chart and only the CRDs need protecting.
+        for change in ({"enabled": False}, None, "target"):
+            state = default_state()
+            if change == "target":
+                state["app"]["spec"]["sources"][0]["targetRevision"] = "42.3.1"
+            elif change is None:
+                del state["app"]["spec"]["syncPolicy"]["automated"]
+            else:
+                state["app"]["spec"]["syncPolicy"]["automated"].update(change)
+            self.assert_blocked(state, "approval required")
         self.assertFalse(any("patch" in call for call in self.calls()))
 
     def test_waits_for_running_traefik_sync_before_protecting(self):
