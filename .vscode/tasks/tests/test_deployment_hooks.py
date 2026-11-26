@@ -90,7 +90,8 @@ elif args[0] == "get":
     elif kind == "crd":
         emit(next(x for x in state["crds"] if x["metadata"]["name"] == args[2]))
     elif kind == "configmap":
-        emit({"data": state.get("config", {"application.resourceTrackingMethod": "annotation+label"})})
+        config = state.get("config", {"application.resourceTrackingMethod": "annotation+label"})
+        emit(None if config is None else {"data": config})
     else:
         error("Unexpected get: " + str(args))
 elif args[0] == "patch":
@@ -699,12 +700,27 @@ class MigrationTests(Fixture):
         state["crds"][0]["metadata"]["annotations"][TRACK] = "traefik:apiextensions.k8s.io/CustomResourceDefinition:/wrong"
         self.assert_blocked(state, "cannot establish ownership")
 
-    def test_custom_label_tracking_cannot_hide_legacy_status_resources(self):
+    def test_label_tracking_uses_configured_instance_label_key(self):
         state = default_state()
         state["config"] = {"application.resourceTrackingMethod": "label", "application.instanceLabelKey": "custom.example/owner"}
         state["crds"][0]["metadata"]["annotations"].pop(TRACK)
         state["crds"][0]["metadata"]["labels"] = {"custom.example/owner": "traefik_traefik"}
-        self.assert_blocked(state, "unsupported/custom")
+        result = self.migrate(state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.crd_patches(), 1)
+        state["config"]["application.resourceTrackingMethod"] = "something-new"
+        self.assert_blocked(state, "Unsupported Argo resourceTrackingMethod")
+
+    def test_untracked_status_listed_crds_are_not_owned_and_skip_without_writes(self):
+        # Argo applies Helm crds/ without tracking metadata, so it never prunes them.
+        for config in ({"application.instanceLabelKey": "argocd.argoproj.io/instance"}, None):
+            state = default_state()
+            state["config"] = config
+            state["crds"][0]["metadata"]["annotations"].pop(TRACK)
+            result = self.migrate(state)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("carry no Argo tracking metadata", result.stdout)
+            self.assertIn("no legacy", result.stdout)
         self.assertFalse(any("patch" in call for call in self.calls()))
 
     def test_experimental_unknown_newer_or_incompatible_versions_block(self):
