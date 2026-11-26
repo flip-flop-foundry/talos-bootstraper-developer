@@ -68,7 +68,8 @@ No Talos entrypoint has been changed.
 
 Offline tests:
 `python3 -m unittest discover -s .vscode/tasks/tests -v`.
-The Gateway migration deliberately requires an administrator to stop application
-controllers for a legacy handover. See `base/gatewayApi/README.md` for the exact
+The Gateway migration asks the administrator for approval, then pauses auto-sync
+for the Traefik Application only (no controller-wide pause). Apply Overlay
+re-enables it with the chart upgrade. See `base/gatewayApi/README.md` for the
 maintenance sequence and recovery. No cluster/Gitea deployment is performed by
 these tests or by implementing this change.

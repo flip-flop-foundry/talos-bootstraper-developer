@@ -14,7 +14,7 @@ BASE_REPO = Path(os.environ.get("TALOS_BOOTSTRAPER_DIR",
 MIGRATION = BASE_REPO / "base/deploymentHooks/beforeArgo/20-gateway-api-migration.sh"
 SYNC = "argocd.argoproj.io/sync-options"
 TRACK = "argocd.argoproj.io/tracking-id"
-SKIP = "argocd.argoproj.io/skip-reconcile"
+REFRESH = "argocd.argoproj.io/refresh"
 GROUP = "gateway.networking.k8s.io"
 NAMES = ("backendtlspolicies", "gatewayclasses", "gateways", "grpcroutes",
          "httproutes", "listenersets", "referencegrants", "tcproutes", "tlsroutes", "udproutes")
@@ -60,17 +60,35 @@ elif args[0] == "get":
     if state.get("forbidden") == kind:
         error("Forbidden")
     if kind == "crd" and args[2] == "applications.argoproj.io":
-        emit({"kind": "CustomResourceDefinition"} if state.get("api", True) else None)
+        automated = {"prune": {"type": "boolean"}}
+        if state.get("enabled_schema", True):
+            automated["enabled"] = {"type": "boolean"}
+        schema = {"properties": {"spec": {"properties": {"syncPolicy": {"properties": {
+            "automated": {"properties": automated}}}}}}}
+        emit({"kind": "CustomResourceDefinition", "spec": {"versions": [
+            {"name": "v1alpha1", "schema": {"openAPIV3Schema": schema}}]}} if state.get("api", True) else None)
     elif kind == "applications.argoproj.io":
-        emit(state.get("app"))
+        app = state.get("app")
+        if app:
+            # Simulated application controller: acknowledges refresh requests
+            # and reports a running sync for "busy_polls" reads.
+            annotations = app["metadata"].setdefault("annotations", {})
+            if "argocd.argoproj.io/refresh" in annotations and state.get("controller_running", True):
+                del annotations["argocd.argoproj.io/refresh"]
+            if state.get("busy_polls", 0) > 0:
+                state["busy_polls"] -= 1
+                app["operation"] = {"sync": {}}
+            else:
+                app.pop("operation", None)
+            automated = app["spec"].get("syncPolicy", {}).get("automated")
+            if state.get("reenable") and automated and automated.get("enabled") is False:
+                automated["enabled"] = True
+            statefile.write_text(json.dumps(state))
+        emit(app)
     elif kind == "crds":
         emit({"items": state.get("crds", [])})
     elif kind == "crd":
         emit(next(x for x in state["crds"] if x["metadata"]["name"] == args[2]))
-    elif kind == "deployments,statefulsets":
-        emit({"items": state["controllers"]})
-    elif kind == "pods":
-        emit({"items": state.get("pods", [])})
     elif kind == "configmap":
         emit({"data": state.get("config", {"application.resourceTrackingMethod": "annotation+label"})})
     else:
@@ -82,7 +100,12 @@ elif args[0] == "patch":
     patch = json.loads(args[args.index("-p") + 1])
     if patch[0]["op"] != "test" or patch[0]["value"] != obj["metadata"]["resourceVersion"]:
         error("Missing/stale resourceVersion precondition")
-    obj["metadata"]["annotations"] = patch[1]["value"]
+    for op in patch[1:]:
+        parts = [p.replace("~1", "/").replace("~0", "~") for p in op["path"].strip("/").split("/")]
+        target = obj
+        for part in parts[:-1]:
+            target = target.setdefault(part, {})
+        target[parts[-1]] = op["value"]
     obj["metadata"]["resourceVersion"] = str(int(obj["metadata"]["resourceVersion"]) + 1)
     if state.get("break_verify") and args[1] == "crd":
         obj["metadata"]["annotations"].pop("argocd.argoproj.io/sync-options", None)
@@ -110,12 +133,12 @@ def crd(name="gateways", owner="traefik_traefik", channel="standard", version="v
 def default_state():
     return {
         "app": {"metadata": {"name": "traefik", "namespace": "traefik", "resourceVersion": "1"},
+                "spec": {"sources": [{"chart": "traefik", "repoURL": "https://traefik.github.io/charts",
+                                      "targetRevision": "39.0.8"}],
+                         "syncPolicy": {"automated": {"prune": True, "selfHeal": True}}},
                 "status": {"resources": [{"group": "apiextensions.k8s.io", "kind": "CustomResourceDefinition",
                                           "name": "gateways." + GROUP}]}},
         "crds": [crd()],
-        "controllers": [{"metadata": {"name": "argocd-application-controller"},
-                         "spec": {"replicas": 0, "template": {"spec": {"containers": [
-                             {"image": "quay.io/argoproj/argocd:v3.3.0"}]}}}}],
     }
 
 
@@ -157,7 +180,9 @@ class Fixture(unittest.TestCase):
         return [json.loads(line) for line in self.callsfile.read_text().splitlines()] if self.callsfile.exists() else []
 
     def run_cmd(self, argv):
-        return subprocess.run([str(x) for x in argv], env=self.env, text=True, capture_output=True, timeout=30)
+        # New session: no controlling terminal, so approval prompts fail closed.
+        return subprocess.run([str(x) for x in argv], env=self.env, text=True, capture_output=True, timeout=30,
+                              start_new_session=True)
 
     def hook(self, root, filename, content):
         file = root / "deploymentHooks/beforeArgo" / filename
@@ -455,12 +480,9 @@ class FrameworkTests(Fixture):
         self.env["TALOS_BOOTSTRAPER_DIR"] = str(BASE_REPO)
         with self.envfile.open("a") as env:
             env.write('export TRAEFIK_HELM_VERSION="42.3.1"\nexport ARGOCD_NAMESPACE="argocd"\n')
-        state = default_state()
-        state["controllers"][0]["spec"]["replicas"] = 1
-        self.write_state(state)
         result = self.run_cmd([TASKS / "push-to-gitea.sh", "demo"])
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("scaled to 0", result.stderr)
+        self.assertIn("approval required", result.stderr)
         self.assertNotIn("Fetching Gitea admin", result.stdout)
         self.assertFalse(any("patch" in call or "secret" in call for call in self.calls()))
 
@@ -487,6 +509,8 @@ class MigrationTests(Fixture):
         self.bundle = self.rendered / "gatewayApi/templates"
         self.bundle.mkdir(parents=True)
         self.env["HOOK_RENDERED_DIR"] = str(self.rendered)
+        self.env.update(GATEWAY_API_MIGRATION_APPROVED="true", GATEWAY_API_MIGRATION_POLL_SECONDS="0",
+                        GATEWAY_API_MIGRATION_TIMEOUT_SECONDS="5")
         self.files = []
         for name in NAMES:
             file = self.bundle / f"{GROUP}_{name}.yaml"
@@ -510,9 +534,19 @@ class MigrationTests(Fixture):
         self.traefik.parent.mkdir()
         self.set_chart("42.3.1")
 
-    def set_chart(self, version):
+    def set_chart(self, version, enabled=True):
+        automated = {"prune": True, "selfHeal": True}
+        if enabled is not None:
+            automated["enabled"] = enabled
         self.traefik.write_text(json.dumps({"kind": "Application", "metadata": {"name": "traefik"}, "spec": {
-            "sources": [{"chart": "traefik", "repoURL": "https://traefik.github.io/charts", "targetRevision": version}]}}))
+            "sources": [{"chart": "traefik", "repoURL": "https://traefik.github.io/charts", "targetRevision": version}],
+            "syncPolicy": {"automated": automated}}}))
+
+    def crd_patches(self):
+        return sum(1 for call in self.calls() if "patch" in call and "crd" in call)
+
+    def app_patches(self):
+        return sum(1 for call in self.calls() if "patch" in call and "applications.argoproj.io" in call)
 
     def migrate(self, state=None):
         if state is not None:
@@ -533,28 +567,35 @@ class MigrationTests(Fixture):
         self.assertEqual(metadata["annotations"][SYNC], "Validate=false,Prune=false,Delete=false")
         self.assertEqual(after["crds"][0]["spec"], before["crds"][0]["spec"])
         self.assertEqual(metadata["annotations"][TRACK], before["crds"][0]["metadata"]["annotations"][TRACK])
-        self.assertEqual(after["app"]["metadata"]["annotations"][SKIP], "true")
+        # Only Traefik's auto-sync is disabled; the refresh was acknowledged; nothing else is touched.
+        self.assertIs(after["app"]["spec"]["syncPolicy"]["automated"]["enabled"], False)
+        self.assertNotIn(REFRESH, after["app"]["metadata"]["annotations"])
+        self.assertIn("stays DISABLED until 'Apply Overlay'", result.stdout)
         self.assertFalse(any("delete" in call or "scale" in call for call in self.calls()))
 
     def test_idempotent_no_duplicate_options_or_repeat_crd_patch(self):
         self.assertEqual(self.migrate().returncode, 0)
-        first_patches = sum("patch" in call for call in self.calls())
-        self.assertEqual(self.migrate().returncode, 0)
-        self.assertEqual(sum("patch" in call for call in self.calls()), first_patches)
+        first = self.crd_patches()
+        # A rerun (Apply Overlay's push gate) must not ask for approval again.
+        del self.env["GATEWAY_API_MIGRATION_APPROVED"]
+        result = self.migrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.crd_patches(), first)
+        after = json.loads(self.statefile.read_text())
+        self.assertEqual(after["crds"][0]["metadata"]["annotations"][SYNC], "Validate=false,Prune=false,Delete=false")
 
     def test_unqualified_legacy_identity_is_supported(self):
         state = default_state()
         state["crds"] = [crd(owner="traefik")]
         self.assertEqual(self.migrate(state).returncode, 0)
 
-    def test_adopted_resources_skip_without_quiescing_or_writing(self):
+    def test_adopted_resources_skip_without_pausing_or_writing(self):
         state = default_state()
         state["crds"] = [crd(owner="gateway-api", version="v1.6.3")]
-        state["controllers"][0]["spec"]["replicas"] = 1
         result = self.migrate(state)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no legacy", result.stdout)
-        self.assertFalse(any("patch" in call or "deployments,statefulsets" in call for call in self.calls()))
+        self.assertFalse(any("patch" in call for call in self.calls()))
 
     def test_reachable_fresh_bootstrap_api_absence_skips(self):
         state = default_state()
@@ -574,27 +615,57 @@ class MigrationTests(Fixture):
             self.assert_blocked(state, expected)
         self.assertFalse(any("patch" in call for call in self.calls()))
 
-    def test_running_controllers_gate_before_any_write(self):
-        state = default_state()
-        state["controllers"][0]["spec"]["replicas"] = 1
-        self.assert_blocked(state, "scaled to 0")
+    def test_approval_is_required_before_any_write(self):
+        del self.env["GATEWAY_API_MIGRATION_APPROVED"]
+        self.assert_blocked(default_state(), "approval required")
         self.assertFalse(any("patch" in call for call in self.calls()))
 
-    def test_terminating_pods_and_active_operations_block(self):
-        for change, expected in (({"pods": [{"metadata": {"deletionTimestamp": "now"}}]}, "pods still exist"),
-                                 ({"app": {**default_state()["app"], "operation": {"sync": {}}}}, "active/pending")):
+    def test_waits_for_running_traefik_sync_before_protecting(self):
+        state = default_state()
+        state["busy_polls"] = 3
+        result = self.migrate(state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.statefile.read_text())["busy_polls"], 0)
+        self.assertEqual(self.crd_patches(), 1)
+
+    def test_unacknowledged_refresh_or_endless_sync_time_out_before_crd_writes(self):
+        self.env["GATEWAY_API_MIGRATION_TIMEOUT_SECONDS"] = "0"
+        for change, expected in (({"controller_running": False}, "did not process"),
+                                 ({"busy_polls": 1000}, "still running")):
             state = default_state()
             state.update(change)
             self.assert_blocked(state, expected)
+        self.assertEqual(self.crd_patches(), 0)
+
+    def test_autosync_reenabled_during_wait_blocks(self):
+        state = default_state()
+        state["reenable"] = True
+        self.assert_blocked(state, "re-enabled by someone else")
+        self.assertEqual(self.crd_patches(), 0)
+
+    def test_unsupported_argocd_or_render_without_enabled_blocks_before_writes(self):
+        state = default_state()
+        state["enabled_schema"] = False
+        self.assert_blocked(state, "requires ArgoCD 3.x")
+        self.set_chart("42.3.1", enabled=None)
+        self.assert_blocked(default_state(), "automated.enabled: true")
         self.assertFalse(any("patch" in call for call in self.calls()))
 
-    def test_parent_managed_app_and_unverified_controller_block(self):
+    def test_live_target_chart_protects_without_pausing_traefik(self):
+        state = default_state()
+        state["app"]["spec"]["sources"][0]["targetRevision"] = "42.3.1"
+        result = self.migrate(state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.app_patches(), self.crd_patches()), (0, 1))
+        result = self.migrate()
+        self.assertIn("Handover in progress", result.stdout)
+        self.assertEqual((self.app_patches(), self.crd_patches()), (0, 1))
+
+    def test_parent_managed_app_blocks(self):
         state = default_state()
         state["app"]["metadata"]["ownerReferences"] = [{"kind": "ApplicationSet"}]
         self.assert_blocked(state, "parent manager")
-        state = default_state()
-        state["controllers"][0]["spec"]["template"]["spec"]["containers"][0]["image"] = "argocd:latest"
-        self.assert_blocked(state, "Cannot verify Argo")
+        self.assertFalse(any("patch" in call for call in self.calls()))
 
     def test_cross_installation_ownership_and_wrong_destination_block(self):
         state = default_state()
